@@ -49,35 +49,47 @@ def generate_seo_metadata(filename):
         f"Video Filename: {filename}"
     )
 
-    if GEMINI_API_KEY.startswith("AQ."):
-        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
-        }
-    else:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
-        }
+    endpoints = [
+        (
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
+            }
+        ),
+        (
+            f"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
+            }
+        )
+    ]
 
-    try:
-        res = requests.post(url, json=payload, timeout=30)
-        res.raise_for_status()
-        raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
-        data = json.loads(raw_text)
+    last_error = None
+    for url, payload in endpoints:
+        try:
+            res = requests.post(url, json=payload, timeout=30)
+            res.raise_for_status()
+            raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+            raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
+            data = json.loads(raw_text)
 
-        title = str(data.get("title", fallback_title)).strip()[:100]
-        description = str(data.get("description", fallback_title)).strip()
-        tags = data.get("tags", ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"])
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(",") if t.strip()]
-        return title, description, tags
-    except Exception as e:
-        print(f"AI generation fallback triggered: {e}")
-        return fallback_title[:100], f"{fallback_title}\n\nনতুন শিক্ষামূলক ভিডিও পেতে আমাদের চ্যানেলটি সাবস্ক্রাইব করে রাখুন!", ["শিক্ষামূলক", "বাংলা ভিডিও", "education"]
+            title = str(data.get("title", fallback_title)).strip()[:100]
+            description = str(data.get("description", fallback_title)).strip()
+            tags = data.get("tags", ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"])
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            return title, description, tags
+        except Exception as e:
+            last_error = e
+
+    print(f"AI generation fallback triggered: {last_error}")
+    return (
+        fallback_title[:100],
+        f"{fallback_title}\n\nনতুন শিক্ষামূলক ভিডিও পেতে আমাদের চ্যানেলটি সাবস্ক্রাইব করে রাখুন!",
+        ["শিক্ষামূলক", "বাংলা ভিডিও", "education"]
+    )
 
 def download_video(drive, file_id, dest_path):
     request = drive.files().get_media(fileId=file_id)
@@ -98,7 +110,7 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
             "categoryId": "27"  # 27 = Education
         },
         "status": {
-            "privacyStatus": "private"  # প্রথম টেস্ট সফল হলে এটিকে "public" করে দেবেন
+            "privacyStatus": "private"  # টেস্ট সফল হলে এটিকে "public" করে দেবেন
         }
     }
     media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)
