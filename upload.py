@@ -40,11 +40,11 @@ def save_uploaded_ids(ids):
 def generate_seo_metadata(filename):
     fallback_title = os.path.splitext(filename)[0].strip()
     prompt = (
-        "You are a YouTube SEO expert. Based on the video filename below, generate:\n"
-        "1. title: A catchy, high-CTR YouTube title (max 90 characters).\n"
-        "2. description: An engaging SEO-friendly YouTube description (2-3 short paragraphs + call-to-action to like & subscribe + 4-5 relevant hashtags at the bottom).\n"
-        "3. tags: A list of 12-15 high-search-volume YouTube tags.\n"
-        "Language rule: If the filename is in Bangla or Banglish, write title and description in natural Bengali. Otherwise write in English.\n"
+        "You are a Bengali YouTube SEO expert for an educational channel. Based on the video filename below, generate:\n"
+        "1. title: A catchy, high-CTR educational YouTube title in natural Bengali (max 90 characters).\n"
+        "2. description: An engaging SEO-friendly YouTube description in natural Bengali (2-3 short paragraphs explaining the topic + call-to-action in Bengali to like, comment & subscribe + 4-5 relevant hashtags at the bottom).\n"
+        "3. tags: A list of 12-15 high-search-volume YouTube tags in Bengali (you may include a few commonly searched educational terms).\n"
+        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title and description strictly in natural Bengali.\n"
         "Return ONLY valid JSON with exact keys: title, description, tags.\n\n"
         f"Video Filename: {filename}"
     )
@@ -71,13 +71,13 @@ def generate_seo_metadata(filename):
 
         title = str(data.get("title", fallback_title)).strip()[:100]
         description = str(data.get("description", fallback_title)).strip()
-        tags = data.get("tags", ["youtube", "video"])
+        tags = data.get("tags", ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"])
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
         return title, description, tags
     except Exception as e:
         print(f"AI generation fallback triggered: {e}")
-        return fallback_title[:100], f"{fallback_title}\n\nআমাদের চ্যানেলটি সাবস্ক্রাইব করতে ভুলবেন না!", ["youtube", "video"]
+        return fallback_title[:100], f"{fallback_title}\n\nনতুন শিক্ষামূলক ভিডিও পেতে আমাদের চ্যানেলটি সাবস্ক্রাইব করে রাখুন!", ["শিক্ষামূলক", "বাংলা ভিডিও", "education"]
 
 def download_video(drive, file_id, dest_path):
     request = drive.files().get_media(fileId=file_id)
@@ -95,10 +95,10 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
             "title": title,
             "description": description,
             "tags": tags,
-            "categoryId": "22"  # 22 = People & Blogs, 28 = Science & Tech
+            "categoryId": "27"  # 27 = Education
         },
         "status": {
-            "privacyStatus": "private"  # টেস্ট সফল হলে এটিকে "public" করে দেবেন
+            "privacyStatus": "private"  # প্রথম টেস্ট সফল হলে এটিকে "public" করে দেবেন
         }
     }
     media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)
@@ -124,8 +124,8 @@ def main():
         print("No new videos found.")
         return
 
-    # প্রতি রানে সর্বোচ্চ ২টি ভিডিও আপলোড করবে (YouTube API কোটা নিরাপদ রাখতে)
-    for video in new_files[:2]:
+    # প্রতি রানে মাত্র ১টি ভিডিও আপলোড করবে
+    for video in new_files[:1]:
         file_id = video["id"]
         file_name = video["name"]
         temp_path = "/tmp/temp_video.mp4"
