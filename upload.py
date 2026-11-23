@@ -7,11 +7,11 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
-CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
-REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
-FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"].strip()
+CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"].strip()
+REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"].strip()
+FOLDER_ID = os.environ["DRIVE_FOLDER_ID"].strip()
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 
 STATE_FILE = "uploaded_videos.json"
 
@@ -49,28 +49,26 @@ def generate_seo_metadata(filename):
         f"Video Filename: {filename}"
     )
 
-    endpoints = [
-        (
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
-            }
-        ),
-        (
-            f"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
-            }
-        )
-    ]
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
 
-    last_error = None
-    for url, payload in endpoints:
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
+    }
+
+    models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            res = requests.post(url, json=payload, timeout=30)
-            res.raise_for_status()
+            res = requests.post(url, headers=headers, json=payload, timeout=30)
+            if res.status_code != 200:
+                print(f"[{model}] API Error {res.status_code}: {res.text[:300]}")
+                continue
+
             raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
             raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
             data = json.loads(raw_text)
@@ -82,9 +80,9 @@ def generate_seo_metadata(filename):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
             return title, description, tags
         except Exception as e:
-            last_error = e
+            print(f"[{model}] Exception: {e}")
 
-    print(f"AI generation fallback triggered: {last_error}")
+    print("AI generation fallback triggered for all models.")
     return (
         fallback_title[:100],
         f"{fallback_title}\n\nনতুন শিক্ষামূলক ভিডিও পেতে আমাদের চ্যানেলটি সাবস্ক্রাইব করে রাখুন!",
@@ -110,7 +108,7 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
             "categoryId": "27"  # 27 = Education
         },
         "status": {
-            "privacyStatus": "private"  # টেস্ট সফল হলে এটিকে "public" করে দেবেন
+            "privacyStatus": "private"  # বাংলা টাইটেল ঠিকমতো এলে এটিকে "public" করে দেবেন
         }
     }
     media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)
