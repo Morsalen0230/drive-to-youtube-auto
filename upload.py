@@ -59,7 +59,7 @@ def generate_seo_metadata(filename):
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
     }
 
-    models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
