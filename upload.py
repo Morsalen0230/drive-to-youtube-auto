@@ -72,7 +72,6 @@ def clean_tags(tags):
         t = str(t).replace("#", "").replace("<", "").replace(">", "").strip()
         if not t or t in cleaned:
             continue
-        # YouTube API-তে মোট ট্যাগ ৫০০ ক্যারেক্টারের বেশি হলে এরর দেয়, তাই ৪৫০-এর মধ্যে রাখবে
         if total_len + len(t) + 2 > 450:
             break
         cleaned.append(t)
@@ -80,8 +79,16 @@ def clean_tags(tags):
     return cleaned or ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"]
 
 def parse_metadata_json(raw_text, fallback_title):
-    cleaned = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
-    data = json.loads(cleaned)
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
 
     title = clean_title(data.get("title", fallback_title), fallback_title)
     description = str(data.get("description", fallback_title)).strip()
@@ -118,11 +125,61 @@ def generate_with_gemini(prompt, fallback_title):
                 print(f"[Gemini {attempt}/{max_rounds} | {model}] Exception: {e}")
 
         if attempt < max_rounds:
-            wait_seconds = attempt * 10  # ১ম বারের পর ১০ সেকেন্ড, ২য় বারের পর ২০ সেকেন্ড অপেক্ষা
+            wait_seconds = attempt * 10
             print(f"Gemini busy. Waiting {wait_seconds} seconds before retry...")
             time.sleep(wait_seconds)
 
     return None
+
+def get_available_groq_models(headers):
+    try:
+        res = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=20)
+        if res.status_code != 200:
+            print(f"[Groq Models List] Error {res.status_code}: {res.text[:200]}")
+            return []
+
+        models_data = res.json().get("data", [])
+        blocked_keywords = (
+            "whisper", "tts", "guard", "safeguard", "embed",
+            "audio", "speech", "playai", "orpheus", "moderation", "allam"
+        )
+
+        candidates = []
+        for m in models_data:
+            mid = m.get("id", "")
+            if not mid or m.get("active") is False:
+                continue
+            low = mid.lower()
+            if any(b in low for b in blocked_keywords):
+                continue
+            candidates.append(mid)
+
+        def model_priority(mid):
+            low = mid.lower()
+            if "llama-4" in low or "maverick" in low or "scout" in low:
+                return (0, mid)
+            if "qwen" in low:
+                return (1, mid)
+            if "gpt-oss" in low:
+                return (2, mid)
+            if "llama" in low and ("70b" in low or "versatile" in low):
+                return (3, mid)
+            if "kimi" in low or "deepseek" in low:
+                return (4, mid)
+            if "gemma" in low or "mistral" in low:
+                return (5, mid)
+            if "llama" in low:
+                return (6, mid)
+            if "compound" in low:
+                return (8, mid)
+            return (7, mid)
+
+        candidates.sort(key=model_priority)
+        print(f"Discovered active Groq models: {candidates[:8]}")
+        return candidates[:6]
+    except Exception as e:
+        print(f"[Groq Models List] Exception: {e}")
+        return []
 
 def generate_with_groq(prompt, fallback_title):
     if not GROQ_API_KEY:
@@ -136,10 +193,13 @@ def generate_with_groq(prompt, fallback_title):
         "Authorization": f"Bearer {GROQ_API_KEY}"
     }
 
-    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    groq_models = get_available_groq_models(headers)
+    if not groq_models:
+        print("No active Groq chat models found.")
+        return None
 
     for model in groq_models:
-        payload = {
+        base_payload = {
             "model": model,
             "messages": [
                 {
@@ -155,21 +215,29 @@ def generate_with_groq(prompt, fallback_title):
                     "content": prompt
                 }
             ],
-            "response_format": {"type": "json_object"},
             "temperature": 0.7
         }
-        try:
-            res = requests.post(url, headers=headers, json=payload, timeout=30)
-            if res.status_code != 200:
-                print(f"[Groq | {model}] API Error {res.status_code}: {res.text[:200]}")
-                continue
 
-            raw_text = res.json()["choices"][0]["message"]["content"]
-            result = parse_metadata_json(raw_text, fallback_title)
-            print(f"Metadata generated successfully using Groq ({model}).")
-            return result
-        except Exception as e:
-            print(f"[Groq | {model}] Exception: {e}")
+        for use_json_mode in (True, False):
+            payload = dict(base_payload)
+            if use_json_mode:
+                payload["response_format"] = {"type": "json_object"}
+
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=30)
+                if res.status_code == 400 and use_json_mode:
+                    continue
+                if res.status_code != 200:
+                    print(f"[Groq | {model}] API Error {res.status_code}: {res.text[:200]}")
+                    break
+
+                raw_text = res.json()["choices"][0]["message"]["content"]
+                result = parse_metadata_json(raw_text, fallback_title)
+                print(f"Metadata generated successfully using Groq ({model}).")
+                return result
+            except Exception as e:
+                print(f"[Groq | {model}] Exception: {e}")
+                break
 
     return None
 
@@ -201,7 +269,7 @@ def generate_seo_metadata(filename):
     if result is not None:
         return result
 
-    # ২. Gemini ৩ বার ফেইল করলে Groq API ব্যবহার করবে
+    # ২. Gemini ৩ বার ফেইল করলে Groq-এর অ্যাক্টিভ মডেল ব্যবহার করবে
     result = generate_with_groq(prompt, fallback_title)
     if result is not None:
         return result
