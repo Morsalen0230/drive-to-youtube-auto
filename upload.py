@@ -39,15 +39,53 @@ def save_uploaded_ids(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(ids, f, indent=2)
 
+def clean_title(title, fallback_title):
+    title = re.sub(r"\s+", " ", str(title or fallback_title)).strip()
+    if len(title) <= 100:
+        return title
+
+    # টাইটেল ১০০ ক্যারেক্টারের বেশি হলে শেষের #হ্যাশট্যাগ ঠিক রেখে মূল অংশ ছোট করবে
+    parts = title.split(" ")
+    hashtags = []
+    while parts and parts[-1].startswith("#"):
+        hashtags.insert(0, parts.pop())
+
+    main_text = " ".join(parts).strip(" |-–—")
+    tag_str = " ".join(hashtags)
+
+    if tag_str and len(tag_str) < 40:
+        max_main = 100 - len(tag_str) - 1
+        trimmed_main = main_text[:max_main].rsplit(" ", 1)[0].strip(" |-–—")
+        return f"{trimmed_main} {tag_str}".strip()[:100]
+
+    return title[:100].rsplit(" ", 1)[0].strip()
+
+def clean_tags(tags):
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    if not isinstance(tags, list):
+        tags = ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "bangla education", "shorts"]
+
+    cleaned = []
+    total_len = 0
+    for t in tags:
+        t = str(t).replace("#", "").replace("<", "").replace(">", "").strip()
+        if not t or t in cleaned:
+            continue
+        # YouTube API-তে মোট ট্যাগ ৫০০ ক্যারেক্টারের বেশি হলে এরর দেয়, তাই ৪৫০-এর মধ্যে রাখবে
+        if total_len + len(t) + 2 > 450:
+            break
+        cleaned.append(t)
+        total_len += len(t) + 2
+    return cleaned or ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"]
+
 def parse_metadata_json(raw_text, fallback_title):
     cleaned = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.IGNORECASE)
     data = json.loads(cleaned)
 
-    title = str(data.get("title", fallback_title)).strip()[:100]
+    title = clean_title(data.get("title", fallback_title), fallback_title)
     description = str(data.get("description", fallback_title)).strip()
-    tags = data.get("tags", ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"])
-    if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    tags = clean_tags(data.get("tags"))
     return title, description, tags
 
 def generate_with_gemini(prompt, fallback_title):
@@ -106,7 +144,11 @@ def generate_with_groq(prompt, fallback_title):
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a Bengali YouTube SEO expert. Always respond strictly with valid JSON containing keys: title, description, tags. Write title and description in natural Bengali."
+                    "content": (
+                        "You are an expert Bengali YouTube SEO strategist. "
+                        "Always respond strictly with valid JSON containing keys: title, description, tags. "
+                        "Write title and description strictly in natural Bengali, following all length and hashtag rules."
+                    )
                 },
                 {
                     "role": "user",
@@ -134,11 +176,22 @@ def generate_with_groq(prompt, fallback_title):
 def generate_seo_metadata(filename):
     fallback_title = os.path.splitext(filename)[0].strip()
     prompt = (
-        "You are a Bengali YouTube SEO expert for an educational channel. Based on the video filename below, generate:\n"
-        "1. title: A catchy, high-CTR educational YouTube title in natural Bengali (max 90 characters).\n"
-        "2. description: An engaging SEO-friendly YouTube description in natural Bengali (2-3 short paragraphs explaining the topic + call-to-action in Bengali to like, comment & subscribe + 4-5 relevant hashtags at the bottom).\n"
-        "3. tags: A list of 12-15 high-search-volume YouTube tags in Bengali (you may include a few commonly searched educational terms).\n"
-        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title and description strictly in natural Bengali.\n"
+        "You are a top Bengali YouTube SEO expert for an educational channel. Based on the video filename below, generate highly optimized YouTube metadata:\n\n"
+        "1. title:\n"
+        "   - Write a catchy, search-optimized, high-CTR educational title in natural Bengali with the primary keyword placed near the beginning.\n"
+        "   - MUST include 2 to 3 short, relevant hashtags right at the end of the title (e.g., #shorts #learn #bangla or #shorts #learn + 1 short topic hashtag).\n"
+        "   - Keep the ENTIRE title (Bengali text + hashtags combined) strictly under 95 characters so nothing gets cut off.\n\n"
+        "2. description:\n"
+        "   - Write a deeply SEO-friendly, well-structured YouTube description strictly in natural Bengali using this clean format:\n"
+        "     * Opening Hook (2-3 lines): Naturally include the main Bengali search keywords and clearly explain what viewers will gain.\n"
+        "     * Bullet Section ('এই ভিডিওতে যা জানবেন:'): 3 to 4 crisp bullet points (using ✅ or •) covering key takeaways with secondary search keywords.\n"
+        "     * Engagement & CTA: A short friendly Bengali line encouraging viewers to Like, Comment their question, Share, and Subscribe for more educational videos.\n"
+        "     * Hashtags at the bottom: 6 to 8 relevant hashtags on the last line (including #shorts #learn #bangla and topic-specific hashtags).\n"
+        "   - Use clean line breaks (\\n) between sections for readability. Avoid spammy raw keyword lists.\n\n"
+        "3. tags:\n"
+        "   - A JSON list of 15 to 18 high-search-volume YouTube tags (without # symbol).\n"
+        "   - Mix natural Bengali search terms, popular Banglish search queries (used by Bangladeshi viewers), and a few relevant English educational keywords.\n\n"
+        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title text and description strictly in natural, fluent Bengali.\n"
         "Return ONLY valid JSON with exact keys: title, description, tags.\n\n"
         f"Video Filename: {filename}"
     )
