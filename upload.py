@@ -63,7 +63,11 @@ def get_google_services():
 def load_uploaded_ids():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            content = f.read().strip()
+            if not content:
+                return []
+            data = json.loads(content)
+            return data if isinstance(data, list) else []
     return []
 
 def save_uploaded_ids(ids):
@@ -417,6 +421,8 @@ def download_video(drive, file_id, dest_path):
             status, done = downloader.next_chunk()
             if status:
                 print(f"Downloading: {int(status.progress() * 100)}%")
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) <= 0:
+        raise RuntimeError("Downloaded video file is empty (0 bytes).")
 
 def upload_to_youtube(youtube, video_path, title, description, tags):
     body = {
@@ -476,10 +482,11 @@ def extract_folder_id(raw_value):
     low = val.lower()
     if not val or low.startswith("drive_folder_id") or low.startswith("your_"):
         return ""
-    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", val)
-    if match:
-        return match.group(1)
-    return val
+    for pattern in (r"/folders/([a-zA-Z0-9_-]+)", r"[?&]id=([a-zA-Z0-9_-]+)"):
+        match = re.search(pattern, val)
+        if match:
+            return match.group(1)
+    return val if re.fullmatch(r"[a-zA-Z0-9_-]+", val) else ""
 
 def get_configured_folders():
     active = []
@@ -507,7 +514,7 @@ def get_configured_folders():
 
 def append_attribution(description, attribution):
     base_desc = str(description or "").strip()
-    attr_text = str(attribution or "").strip()
+    attr_text = str(attribution or "").replace("<", "").replace(">", "").strip()
     if not attr_text:
         return base_desc[:5000]
     max_base_len = max(0, 5000 - len(attr_text) - 2)
@@ -533,7 +540,11 @@ def main():
 
     for folder in shuffled_folders:
         folder_id = folder["folder_id"]
-        files = list_drive_videos(drive, folder_id)
+        try:
+            files = list_drive_videos(drive, folder_id)
+        except Exception as e:
+            print(f"[Warning] Failed to read Folder #{folder['index']} ({folder_id}): {e}")
+            continue
         new_files = [f for f in files if f["id"] not in uploaded_set]
         if new_files:
             selected_folder = folder
@@ -564,11 +575,12 @@ def main():
     if attribution:
         print(f"Appended Attribution: {attribution}")
 
-    download_video(drive, file_id, temp_path)
-    upload_to_youtube(youtube, temp_path, title, description, tags)
-
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
+    try:
+        download_video(drive, file_id, temp_path)
+        upload_to_youtube(youtube, temp_path, title, description, tags)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
     uploaded_ids.append(file_id)
     save_uploaded_ids(uploaded_ids)
