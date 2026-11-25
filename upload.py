@@ -24,16 +24,25 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 # ==============================================================================
 DRIVE_FOLDERS = [
     {
-        "folder_id": "drive_folder_id_1",
-        "attribution": "folder 1 attribution",
+        "folder_id": "1GmFpEtNuRaJK3yQiJK3XdG1fpW_3JNO5",
+        "attribution": "Original Video: Ad Astra Muse - Nozima Qadamova (4K) | Early Bloomer (E65)
+Creator: Ad Astra
+Source: https://www.youtube.com/watch?v=IN6RBu-j6JQ
+License: Creative Commons Attribution (CC BY).",
     },
     {
-        "folder_id": "drive_folder_id_2",
-        "attribution": "folder 2 attribution",
+        "folder_id": "1DskbS2pUpDFQeWsPjSl0ATvLpDrWWM0s",
+        "attribution": "Original Video: IELTS Speaking Test- Perfect Band 9
+Creator: IELTS Advantage
+Source: https://www.youtube.com/watch?v=IevmdO16GuE
+License: Creative Commons Attribution (CC BY).",
     },
     {
-        "folder_id": "drive_folder_id_3",
-        "attribution": "folder 3 attribution",
+        "folder_id": "1omq1SmE2TCpeD36wNVwbcSbNnkXhd1rn",
+        "attribution": "Original Video: IELTS Speaking- Perfect Pronunciation and Fluency
+Creator: IELTS Advantage
+Source: https://www.youtube.com/watch?v=8pnGARTYMpg
+License: Creative Commons Attribution (CC BY).",
     },
     # নতুন ফোল্ডার যোগ করতে উপরের ব্লকের শেষে কমা (,) রেখে নিচে একইভাবে লিখুন:
     # {
