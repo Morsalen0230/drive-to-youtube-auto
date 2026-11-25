@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import random
 import re
 import time
 import requests
@@ -11,9 +12,39 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"].strip()
 CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"].strip()
 REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"].strip()
-FOLDER_ID = os.environ["DRIVE_FOLDER_ID"].strip()
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+FALLBACK_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+
+# ==============================================================================
+# GOOGLE DRIVE FOLDERS & ATTRIBUTION SETTINGS
+# নিচে কমা (,) দিয়ে ২, ৩, ৪... ১০ বা যত খুশি ফোল্ডার যোগ করতে পারবেন।
+# - "folder_id": আপনার Google Drive ফোল্ডারের ID (বা ফোল্ডারের লিংক) বসান
+# - "attribution": YouTube ডেসক্রিপশনের একদম শেষে যে লেখাটি যোগ হবে (না চাইলে "" রাখুন)
+# ==============================================================================
+DRIVE_FOLDERS = [
+    {
+        "folder_id": "drive_folder_id_1",
+        "attribution": "folder 1 attribution",
+    },
+    {
+        "folder_id": "drive_folder_id_2",
+        "attribution": "folder 2 attribution",
+    },
+    {
+        "folder_id": "drive_folder_id_3",
+        "attribution": "folder 3 attribution",
+    },
+    # নতুন ফোল্ডার যোগ করতে উপরের ব্লকের শেষে কমা (,) রেখে নিচে একইভাবে লিখুন:
+    # {
+    #     "folder_id": "drive_folder_id_4",
+    #     "attribution": "folder 4 attribution",
+    # },
+    # {
+    #     "folder_id": "drive_folder_id_5",
+    #     "attribution": "folder 5 attribution",
+    # },
+]
 
 STATE_FILE = "uploaded_videos.json"
 
@@ -40,7 +71,10 @@ def save_uploaded_ids(ids):
         json.dump(ids, f, indent=2)
 
 def clean_title(title, fallback_title):
-    title = re.sub(r"\s+", " ", str(title or fallback_title)).strip()
+    raw = str(title or fallback_title).replace("<", "").replace(">", "")
+    title = re.sub(r"\s+", " ", raw).strip().strip('"')
+    if not title:
+        title = re.sub(r"\s+", " ", str(fallback_title)).replace("<", "").replace(">", "").strip()[:100] or "শিক্ষামূলক ভিডিও #shorts"
     if len(title) <= 100:
         return title
 
@@ -78,6 +112,15 @@ def clean_tags(tags):
         total_len += len(t) + 2
     return cleaned or ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"]
 
+def clean_description(description, fallback_title):
+    text = str(description or fallback_title)
+    text = text.replace("\\n", "\n").replace("\r\n", "\n")
+    text = text.replace("<", "").replace(">", "")
+    lines = [line.rstrip() for line in text.split("\n")]
+    text = "\n".join(lines).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
 def parse_metadata_json(raw_text, fallback_title):
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
     cleaned = re.sub(r"^```json\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
@@ -91,21 +134,88 @@ def parse_metadata_json(raw_text, fallback_title):
         data = json.loads(match.group(0))
 
     title = clean_title(data.get("title", fallback_title), fallback_title)
-    description = str(data.get("description", fallback_title)).strip()
+    description = clean_description(data.get("description", fallback_title), fallback_title)
     tags = clean_tags(data.get("tags"))
     return title, description, tags
 
+def get_available_gemini_models(headers):
+    fallback_models = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+    try:
+        res = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers=headers,
+            timeout=20,
+        )
+        if res.status_code != 200:
+            print(f"[Gemini Models List] Error {res.status_code}: {res.text[:200]}")
+            return fallback_models
+
+        models_data = res.json().get("models", [])
+        blocked_keywords = (
+            "tts", "image", "audio", "live", "embed", "vision",
+            "computer-use", "robotics", "1.5", "2.0", "8b", "exp"
+        )
+
+        candidates = []
+        for m in models_data:
+            methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods:
+                continue
+            mid = m.get("name", "").replace("models/", "").strip()
+            low = mid.lower()
+            if not low.startswith("gemini-") or "flash" not in low:
+                continue
+            if any(b in low for b in blocked_keywords):
+                continue
+            candidates.append(mid)
+
+        if not candidates:
+            return fallback_models
+
+        def gemini_priority(mid):
+            low = mid.lower()
+            ver_match = re.match(r"^gemini-(\d+(?:\.\d+)?)-", low)
+            version = float(ver_match.group(1)) if ver_match else (2.9 if "latest" in low else 0.0)
+            is_preview = 1 if "preview" in low else 0
+            is_lite = 1 if "lite" in low else 0
+            is_dated = 1 if re.search(r"-(\d{3}|\d{2}-\d{4}|\d{4}-\d{2})$", low) else 0
+            return (-version, is_preview, is_lite, is_dated, low)
+
+        modern = [c for c in candidates if not c.startswith("gemini-2.5")]
+        pool = modern if modern else candidates
+        pool.sort(key=gemini_priority)
+
+        base_set = set(pool)
+        deduped = [
+            m for m in pool
+            if not (
+                re.search(r"-(\d{3}|\d{2}-\d{4}|\d{4}-\d{2})$", m)
+                and re.sub(r"-(\d{3}|\d{2}-\d{4}|\d{4}-\d{2})$", "", m) in base_set
+            )
+        ]
+
+        selected = (deduped or pool)[:3]
+        print(f"Discovered active Gemini models: {selected}")
+        return selected
+    except Exception as e:
+        print(f"[Gemini Models List] Exception: {e}")
+        return fallback_models
+
 def generate_with_gemini(prompt, fallback_title):
+    if not GEMINI_API_KEY:
+        print("GEMINI_API_KEY is not set in GitHub Secrets. Skipping Gemini.")
+        return None
+
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY
     }
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"}
     }
 
-    models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    models = get_available_gemini_models(headers)
     max_rounds = 3  # Gemini-তে মোট ৩ বার চেষ্টা করবে
 
     for attempt in range(1, max_rounds + 1):
@@ -117,7 +227,17 @@ def generate_with_gemini(prompt, fallback_title):
                     print(f"[Gemini {attempt}/{max_rounds} | {model}] API Error {res.status_code}: {res.text[:200]}")
                     continue
 
-                raw_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                candidates = res.json().get("candidates", [])
+                if not candidates:
+                    print(f"[Gemini {attempt}/{max_rounds} | {model}] Empty candidates: {res.text[:200]}")
+                    continue
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text_parts = [p["text"] for p in parts if "text" in p and not p.get("thought")]
+                if not text_parts:
+                    text_parts = [p["text"] for p in parts if "text" in p]
+                raw_text = "\n".join(text_parts).strip()
+
                 result = parse_metadata_json(raw_text, fallback_title)
                 print(f"Metadata generated successfully using Gemini ({model}, attempt {attempt}).")
                 return result
@@ -205,9 +325,9 @@ def generate_with_groq(prompt, fallback_title):
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert Bengali YouTube SEO strategist. "
+                        "You are an expert Bengali YouTube SEO strategist and content writer. "
                         "Always respond strictly with valid JSON containing keys: title, description, tags. "
-                        "Write title and description strictly in natural Bengali, following all length and hashtag rules."
+                        "Write a rich, detailed, visually well-formatted Bengali YouTube description following every section, divider, bullet, and hashtag rule."
                     )
                 },
                 {
@@ -244,22 +364,34 @@ def generate_with_groq(prompt, fallback_title):
 def generate_seo_metadata(filename):
     fallback_title = os.path.splitext(filename)[0].strip()
     prompt = (
-        "You are a top Bengali YouTube SEO expert for an educational channel. Based on the video filename below, generate highly optimized YouTube metadata:\n\n"
+        "You are a top Bengali YouTube SEO expert and professional content writer for an educational channel. "
+        "Based on the video filename below, generate highly optimized, engaging YouTube metadata:\n\n"
         "1. title:\n"
-        "   - Write a catchy, search-optimized, high-CTR educational title in natural Bengali with the primary keyword placed near the beginning.\n"
-        "   - MUST include 2 to 3 short, relevant hashtags right at the end of the title (e.g., #shorts #learn #bangla or #shorts #learn + 1 short topic hashtag).\n"
-        "   - Keep the ENTIRE title (Bengali text + hashtags combined) strictly under 95 characters so nothing gets cut off.\n\n"
+        "   - Write a highly clickable (high-CTR), search-optimized Bengali YouTube title that sparks curiosity while staying clear and accurate.\n"
+        "   - Place the primary Bengali search keyword right within the first 3 to 5 words so it ranks strongly in YouTube Search.\n"
+        "   - Use a clean, natural structure when appropriate (e.g., 'মূল কিওয়ার্ড | আকর্ষণীয় প্রশ্ন বা চমকপ্রদ তথ্য!' or a crisp, punchy single phrase in natural Bengali—never robotic literal translation).\n"
+        "   - MUST include 2 to 3 short, relevant hashtags right at the end of the title (e.g., #shorts #learn #bangla or #shorts #বাংলা + 1 short topic hashtag).\n"
+        "   - Keep the ENTIRE title (Bengali text + hashtags combined) between 55 and 92 characters (strictly under 95 characters) so nothing gets cut off.\n\n"
         "2. description:\n"
-        "   - Write a deeply SEO-friendly, well-structured YouTube description strictly in natural Bengali using this clean format:\n"
-        "     * Opening Hook (2-3 lines): Naturally include the main Bengali search keywords and clearly explain what viewers will gain.\n"
-        "     * Bullet Section ('এই ভিডিওতে যা জানবেন:'): 3 to 4 crisp bullet points (using ✅ or •) covering key takeaways with secondary search keywords.\n"
-        "     * Engagement & CTA: A short friendly Bengali line encouraging viewers to Like, Comment their question, Share, and Subscribe for more educational videos.\n"
-        "     * Hashtags at the bottom: 6 to 8 relevant hashtags on the last line (including #shorts #learn #bangla and topic-specific hashtags).\n"
-        "   - Use clean line breaks (\\n) between sections for readability. Avoid spammy raw keyword lists.\n\n"
+        "   - Write a rich, comprehensive, visually attractive, and deeply SEO-optimized YouTube description (around 220 to 350 words) strictly in natural, fluent Bengali.\n"
+        "   - Follow this exact clean visual layout using blank lines (\\n\\n) and thin dividers (━━━━━━━━━━━━━━━━━━━━) so it looks polished and easy to read on YouTube:\n\n"
+        "     * আকর্ষণীয় ওপেনিং হুক (3-4 lines, no heading): Start immediately with an engaging hook containing the primary Bengali search keywords in the first 2 lines (visible above 'More'), explaining clearly what the topic is and why watching this video matters.\n\n"
+        "     ━━━━━━━━━━━━━━━━━━━━\n"
+        "     📖 ভিডিওর বিস্তারিত আলোচনা:\n"
+        "     Write a clear, informative 4 to 6 line paragraph explaining the concept in simple, engaging Bengali, naturally weaving in secondary and long-tail Bengali search phrases.\n\n"
+        "     📌 এই ভিডিও থেকে যা যা শিখবেন:\n"
+        "     Write 5 to 6 well-explained bullet points (each starting with ✅ on a new line) highlighting the key lessons, facts, or practical takeaways.\n\n"
+        "     💡 কেন এই বিষয়টি জানা জরুরি:\n"
+        "     Write 2 to 3 lines explaining how this knowledge helps students, learners, or curious viewers in real life or studies.\n\n"
+        "     ━━━━━━━━━━━━━━━━━━━━\n"
+        "     🔔 আমাদের সাথে যুক্ত থাকুন:\n"
+        "     Write a warm, friendly 2 to 3 line Bengali Call-to-Action inviting viewers to Like (👍) the video, share their thoughts or questions in the Comments (💬), Share with friends, and Subscribe to the channel for regular educational videos.\n\n"
+        "     * Hashtags Line (at the bottom): Include 8 to 10 relevant hashtags on the final line (must include #shorts #learn #bangla #শিক্ষামূলক plus topic-specific Bangla & English hashtags).\n"
+        "   - Never use angle brackets (< or >). Avoid spammy comma-separated raw keyword dumps inside the description.\n\n"
         "3. tags:\n"
         "   - A JSON list of 15 to 18 high-search-volume YouTube tags (without # symbol).\n"
         "   - Mix natural Bengali search terms, popular Banglish search queries (used by Bangladeshi viewers), and a few relevant English educational keywords.\n\n"
-        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title text and description strictly in natural, fluent Bengali.\n"
+        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title text and the entire description prose strictly in natural, fluent, standard Bengali.\n"
         "Return ONLY valid JSON with exact keys: title, description, tags.\n\n"
         f"Video Filename: {filename}"
     )
@@ -295,11 +427,20 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
             "categoryId": "27"  # 27 = Education
         },
         "status": {
-            "privacyStatus": "public"  # সরাসরি পাবলিক হিসেবে আপলোড হবে
+            "privacyStatus": "public",          # সরাসরি পাবলিক হিসেবে আপলোড হবে
+            "selfDeclaredMadeForKids": False,   # No, it's not made for kids
+            "containsSyntheticMedia": False     # AI use: No
+        },
+        "paidProductPlacementDetails": {
+            "hasPaidProductPlacement": False    # Paid promotion: No
         }
     }
     media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    request = youtube.videos().insert(
+        part="snippet,status,paidProductPlacementDetails",
+        body=body,
+        media_body=media,
+    )
 
     response = None
     while response is None:
@@ -308,43 +449,129 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
             print(f"Uploading to YouTube: {int(status.progress() * 100)}%")
     print(f"Published! Video ID: {response.get('id')}")
 
+def list_drive_videos(drive, folder_id):
+    query = f"'{folder_id}' in parents and mimeType contains 'video/' and trashed = false"
+    files = []
+    page_token = None
+
+    while True:
+        results = drive.files().list(
+            q=query,
+            pageSize=1000,
+            fields="nextPageToken, files(id, name)",
+            orderBy="createdTime asc",
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    return files
+
+def extract_folder_id(raw_value):
+    val = str(raw_value or "").strip()
+    low = val.lower()
+    if not val or low.startswith("drive_folder_id") or low.startswith("your_"):
+        return ""
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", val)
+    if match:
+        return match.group(1)
+    return val
+
+def get_configured_folders():
+    active = []
+    for idx, entry in enumerate(DRIVE_FOLDERS, start=1):
+        folder_id = extract_folder_id(entry.get("folder_id", ""))
+        if not folder_id:
+            continue
+        attribution = str(entry.get("attribution", "") or "").strip()
+        active.append({
+            "index": idx,
+            "folder_id": folder_id,
+            "attribution": attribution,
+        })
+
+    if not active and FALLBACK_FOLDER_ID:
+        fallback_id = extract_folder_id(FALLBACK_FOLDER_ID)
+        if fallback_id:
+            active.append({
+                "index": 1,
+                "folder_id": fallback_id,
+                "attribution": "",
+            })
+
+    return active
+
+def append_attribution(description, attribution):
+    base_desc = str(description or "").strip()
+    attr_text = str(attribution or "").strip()
+    if not attr_text:
+        return base_desc[:5000]
+    max_base_len = max(0, 5000 - len(attr_text) - 2)
+    trimmed_base = base_desc[:max_base_len].rstrip()
+    return f"{trimmed_base}\n\n{attr_text}" if trimmed_base else attr_text[:5000]
+
 def main():
-    drive, youtube = get_google_services()
-    uploaded_ids = load_uploaded_ids()
-
-    query = f"'{FOLDER_ID}' in parents and mimeType contains 'video/' and trashed = false"
-    results = drive.files().list(q=query, fields="files(id, name)", orderBy="createdTime asc").execute()
-    files = results.get("files", [])
-
-    new_files = [f for f in files if f["id"] not in uploaded_ids]
-    if not new_files:
-        print("No new videos found.")
+    configured_folders = get_configured_folders()
+    if not configured_folders:
+        print("No valid Google Drive folder IDs configured in DRIVE_FOLDERS.")
         return
 
-    # প্রতি রানে মাত্র ১টি ভিডিও আপলোড করবে
-    for video in new_files[:1]:
-        file_id = video["id"]
-        file_name = video["name"]
-        temp_path = "/tmp/temp_video.mp4"
+    drive, youtube = get_google_services()
+    uploaded_ids = load_uploaded_ids()
+    uploaded_set = set(uploaded_ids)
 
-        print(f"\nProcessing: {file_name}")
-        metadata = generate_seo_metadata(file_name)
+    # ফোল্ডারগুলো র‍্যান্ডম অর্ডারে সাজিয়ে প্রথম যে ফোল্ডারে নতুন ভিডিও পাবে সেটি নেবে
+    shuffled_folders = list(configured_folders)
+    random.shuffle(shuffled_folders)
 
-        if metadata is None:
-            print("Both Gemini and Groq APIs failed. Skipping upload for this run so it retries cleanly next time.")
-            return
+    selected_folder = None
+    selected_video = None
 
-        title, description, tags = metadata
-        print(f"Generated Title: {title}")
+    for folder in shuffled_folders:
+        folder_id = folder["folder_id"]
+        files = list_drive_videos(drive, folder_id)
+        new_files = [f for f in files if f["id"] not in uploaded_set]
+        if new_files:
+            selected_folder = folder
+            selected_video = new_files[0]  # পুরনো থেকে নতুন ক্রমে প্রথম আন-আপলোডেড ভিডিও
+            break
+        print(f"No new videos in Folder #{folder['index']} ({folder_id}). Checking next folder...")
 
-        download_video(drive, file_id, temp_path)
-        upload_to_youtube(youtube, temp_path, title, description, tags)
+    if not selected_video:
+        print("No new videos found in any configured Drive folder.")
+        return
 
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    file_id = selected_video["id"]
+    file_name = selected_video["name"]
+    attribution = selected_folder["attribution"]
+    temp_path = "/tmp/temp_video.mp4"
 
-        uploaded_ids.append(file_id)
-        save_uploaded_ids(uploaded_ids)
+    print(f"\nSelected Folder #{selected_folder['index']} ({selected_folder['folder_id']})")
+    print(f"Processing: {file_name}")
+    metadata = generate_seo_metadata(file_name)
+
+    if metadata is None:
+        print("Both Gemini and Groq APIs failed. Skipping upload for this run so it retries cleanly next time.")
+        return
+
+    title, description, tags = metadata
+    description = append_attribution(description, attribution)
+    print(f"Generated Title: {title}")
+    if attribution:
+        print(f"Appended Attribution: {attribution}")
+
+    download_video(drive, file_id, temp_path)
+    upload_to_youtube(youtube, temp_path, title, description, tags)
+
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+
+    uploaded_ids.append(file_id)
+    save_uploaded_ids(uploaded_ids)
 
 if __name__ == "__main__":
     main()
