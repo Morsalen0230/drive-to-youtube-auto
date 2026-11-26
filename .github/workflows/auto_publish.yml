@@ -1,9 +1,7 @@
 name: Auto Publish Drive Videos to YouTube
 
 on:
-  schedule:
-    - cron: '23 */4 * * *' # প্রতি ৪ ঘণ্টা পরপর অটোমেটিক চলবে (6:23, 10:23, 2:23)
-  workflow_dispatch:       # ম্যানুয়ালি টেস্ট করার জন্য Run বাটন চালু রাখবে
+  workflow_dispatch:       # cron-job.org ও ম্যানুয়ালি Run করার জন্য চালু থাকবে
 
 permissions:
   contents: write
@@ -38,4 +36,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add uploaded_videos.json
-          git diff --staged --quiet || (git commit -m "Update uploaded videos log" && git push)
+          git diff --staged --quiet || (git commit -m "Update uploaded videos log" && git pull --rebase origin main && git push)
