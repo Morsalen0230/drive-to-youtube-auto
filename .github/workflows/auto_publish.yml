@@ -2,8 +2,8 @@ name: Auto Publish Drive Videos to YouTube
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # প্রতি ৪ ঘণ্টা পরপর অটোমেটিক চলবে (দিনে ৬ বার)
-  workflow_dispatch:       # ম্যানুয়ালি টেস্ট করার জন্য Run বাটন চালু রাখবে
+    - cron: '23 */4 * * *' # প্রতি ৪ ঘণ্টা পরপর অটোমেটিক চলবে (6:23, 10:23, 2:23)
+  workflow_dispatch:       # ম্যানুয়ালি টেস্ট করার জন্য Run বাটন চালু রাখবে
 
 permissions:
   contents: write
