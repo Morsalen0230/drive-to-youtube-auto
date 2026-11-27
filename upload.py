@@ -670,10 +670,20 @@ def render_badge_with_twemoji(badge_text):
             continue
         if cp > 0x2000 and not (0x0980 <= cp <= 0x09FF):
             hex_cp = f"{cp:x}"
-            parts.append(
-                f'<img class="emoji-icon" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/{hex_cp}.svg" '
-                f'alt="{html.escape(ch)}" onerror="this.replaceWith(document.createTextNode(this.alt))" />'
-            )
+            svg_uri = None
+            try:
+                r = requests.get(
+                    f"https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/svg/{hex_cp}.svg",
+                    timeout=4,
+                )
+                if r.status_code == 200 and b"<svg" in r.content:
+                    svg_uri = "data:image/svg+xml;base64," + base64.b64encode(r.content).decode("ascii")
+            except Exception:
+                pass
+            if svg_uri:
+                parts.append(f'<img class="emoji-icon" src="{svg_uri}" alt="" />')
+            else:
+                parts.append(html.escape(ch))
         else:
             parts.append(html.escape(ch))
     return "".join(parts)
@@ -901,29 +911,43 @@ def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
                 hf.write(html_content)
 
             file_url = "file:///" + os.path.abspath(html_path).replace("\\", "/")
-            cmd = [
-                browser,
-                "--headless=new",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--hide-scrollbars",
-                "--force-device-scale-factor=1",
-                f"--window-size={target_w},{target_h}",
-                "--virtual-time-budget=4000",
-                f"--screenshot={png_path}",
-                file_url,
-            ]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=40)
-            if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
-                with Image.open(png_path) as rendered:
-                    cropped = rendered.convert("RGB").crop((0, 0, target_w, target_h))
-                    save_optimized_jpeg(cropped, dest_thumb_path)
-                print(
-                    f"Viral YouTube thumbnail generated ({target_w}x{target_h}, "
-                    f"theme={theme['name']}, size={os.path.getsize(dest_thumb_path) // 1024}KB)."
+            for headless_flags in (
+                ["--headless=new", "--virtual-time-budget=2500"],
+                ["--headless"],
+            ):
+                if os.path.exists(png_path):
+                    os.remove(png_path)
+                cmd = (
+                    [
+                        browser,
+                        *headless_flags,
+                        "--disable-gpu",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-extensions",
+                        "--hide-scrollbars",
+                        "--force-device-scale-factor=1",
+                        f"--window-size={target_w},{target_h}",
+                        f"--screenshot={png_path}",
+                        file_url,
+                    ]
                 )
-                return True
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, timeout=22)
+                except Exception as ce:
+                    print(f"[Info] Browser render attempt ({headless_flags[0]}) warning: {ce}")
+                    continue
+                if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
+                    with Image.open(png_path) as rendered:
+                        cropped = rendered.convert("RGB").crop((0, 0, target_w, target_h))
+                        save_optimized_jpeg(cropped, dest_thumb_path)
+                    print(
+                        f"Viral YouTube thumbnail generated ({target_w}x{target_h}, "
+                        f"theme={theme['name']}, size={os.path.getsize(dest_thumb_path) // 1024}KB)."
+                    )
+                    return True
 
         with Image.open(subject_path) as im:
             im = im.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
