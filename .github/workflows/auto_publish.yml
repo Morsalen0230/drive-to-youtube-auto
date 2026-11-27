@@ -2,6 +2,11 @@ name: Auto Publish Drive Videos to YouTube
 
 on:
   workflow_dispatch:       # cron-job.org ও ম্যানুয়ালি Run করার জন্য চালু থাকবে
+    inputs:
+      repair_video_ids:
+        description: 'Optional comma-separated YouTube Video IDs to regenerate/fix thumbnails only'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -34,6 +39,7 @@ jobs:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          REPAIR_VIDEO_IDS: ${{ inputs.repair_video_ids }}
         run: python upload.py
 
       - name: Save uploaded video history
