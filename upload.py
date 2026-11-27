@@ -986,12 +986,41 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
     return video_id
 
 
-def set_youtube_thumbnail(youtube, video_id, thumb_path, wait_sec=45):
+def wait_for_shorts_indexing(video_id, is_portrait=True, min_wait=65, max_wait=270):
+    """
+    YouTube Shorts overwrites custom thumbnails if thumbnails.set is called BEFORE YouTube finishes
+    generating oar2.jpg (which takes 40s-180s depending on video length/load).
+    We poll the public CDN for oar2.jpg (0 API quota!) and wait 20s extra once ready so our custom
+    thumbnail ALWAYS wins the final Shorts shelf state!
+    """
+    if not is_portrait:
+        print(f"Waiting {min_wait}s for standard video processing...")
+        time.sleep(min_wait)
+        return
+
+    print(f"Waiting for YouTube Shorts indexing (oar2.jpg) on {video_id} (up to {max_wait}s)...")
+    start = time.time()
+    oar_url = f"https://i.ytimg.com/vi/{video_id}/oar2.jpg"
+    while time.time() - start < max_wait:
+        elapsed = int(time.time() - start)
+        if elapsed >= 35:
+            try:
+                r = requests.head(f"{oar_url}?t={int(time.time())}", timeout=10)
+                if r.status_code == 200:
+                    print(f"Shorts indexing (oar2.jpg) detected at {elapsed}s! Waiting 20s buffer before applying thumbnail...")
+                    time.sleep(20)
+                    return
+            except Exception:
+                pass
+        time.sleep(8)
+    print(f"Reached {max_wait}s wait limit; applying custom thumbnail now...")
+
+
+def set_youtube_thumbnail(youtube, video_id, thumb_path, wait_for_index=True, is_portrait=True):
     if not video_id or not os.path.exists(thumb_path):
         return
-    if wait_sec > 0:
-        print(f"Waiting {wait_sec} seconds for YouTube video processing before applying custom thumbnail...")
-        time.sleep(wait_sec)
+    if wait_for_index:
+        wait_for_shorts_indexing(video_id, is_portrait=is_portrait)
     try:
         media = MediaFileUpload(thumb_path, mimetype="image/jpeg", resumable=False)
         youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
@@ -1070,8 +1099,11 @@ def append_attribution(description, attribution):
     return f"{trimmed_base}\n\n{attr_text}" if trimmed_base else attr_text[:5000]
 
 
-def repair_existing_thumbnails(drive, youtube, uploaded_ids, target_yt_ids):
-    """Regenerates and applies crisp 9:16/16:9 thumbnails for already-published YouTube videos without re-uploading."""
+def repair_existing_thumbnails(drive, youtube, uploaded_ids, target_specs):
+    """
+    Regenerates and applies crisp 9:16/16:9 thumbnails for already-published YouTube videos without re-uploading.
+    Accepts specs like 'c-sqW8OTAkE:-3,DnoN5xnvSsY:-1' or plain 'vid1,vid2'.
+    """
     configured_folders = get_configured_folders()
     all_drive_files = {}
     for folder in configured_folders:
@@ -1081,8 +1113,16 @@ def repair_existing_thumbnails(drive, youtube, uploaded_ids, target_yt_ids):
         except Exception:
             continue
 
-    # Match the last N uploaded Drive IDs to the provided YouTube video IDs in order
-    pairs = list(zip(uploaded_ids[-len(target_yt_ids):], target_yt_ids))
+    pairs = []
+    for idx, spec in enumerate(target_specs):
+        if ":" in spec:
+            yt_vid_id, rev_idx_str = spec.split(":", 1)
+            drive_id = uploaded_ids[int(rev_idx_str)]
+            pairs.append((drive_id, yt_vid_id.strip()))
+        else:
+            offset = -len(target_specs) + idx
+            pairs.append((uploaded_ids[offset], spec.strip()))
+
     for drive_id, yt_vid_id in pairs:
         fname = all_drive_files.get(drive_id, "English Speaking Tips.mp4")
         print(f"\n[Repair] Regenerating thumbnail for YouTube {yt_vid_id} (Drive file: {fname})...")
@@ -1093,7 +1133,7 @@ def repair_existing_thumbnails(drive, youtube, uploaded_ids, target_yt_ids):
         try:
             download_video(drive, drive_id, t_vid)
             if generate_viral_thumbnail(t_vid, t_jpg, hook_data):
-                set_youtube_thumbnail(youtube, yt_vid_id, t_jpg, wait_sec=0)
+                set_youtube_thumbnail(youtube, yt_vid_id, t_jpg, wait_for_index=False)
         finally:
             for p in (t_vid, t_jpg):
                 if os.path.exists(p):
@@ -1163,10 +1203,11 @@ def main():
 
     try:
         download_video(drive, file_id, temp_path)
+        vid_w, vid_h, _ = inspect_video_specs(temp_path)
         thumb_ok = generate_viral_thumbnail(temp_path, thumb_path, hook_data)
         video_id = upload_to_youtube(youtube, temp_path, title, description, tags)
         if thumb_ok and video_id:
-            set_youtube_thumbnail(youtube, video_id, thumb_path, wait_sec=45)
+            set_youtube_thumbnail(youtube, video_id, thumb_path, wait_for_index=True, is_portrait=(vid_h >= vid_w))
     finally:
         for p in (temp_path, thumb_path):
             if os.path.exists(p):
