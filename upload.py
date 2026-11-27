@@ -1,13 +1,19 @@
-import os
+import base64
+import html
 import io
 import json
+import os
 import random
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import requests
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageStat
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"].strip()
 CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"].strip()
@@ -44,18 +50,65 @@ Creator: IELTS Advantage
 Source: https://www.youtube.com/watch?v=8pnGARTYMpg
 License: Creative Commons Attribution (CC BY).""",
     },
-    # নতুন ফোল্ডার যোগ করতে উপরের ব্লকের শেষে কমা (,) রেখে নিচে একইভাবে লিখুন:
-    # {
-    #     "folder_id": "drive_folder_id_4",
-    #     "attribution": """folder 4 attribution""",
-    # },
-    # {
-    #     "folder_id": "drive_folder_id_5",
-    #     "attribution": """folder 5 attribution""",
-    # },
 ]
 
 STATE_FILE = "uploaded_videos.json"
+
+VIRAL_THUMB_THEMES = [
+    {
+        "name": "mrbeast_yellow",
+        "badge_bg": "linear-gradient(135deg, #FF0844 0%, #FF5500 100%)",
+        "badge_text": "#FFFFFF",
+        "badge_border": "#FFFFFF",
+        "badge_glow": "rgba(255, 20, 68, 0.70)",
+        "tape_bg": "linear-gradient(135deg, #FFE600 0%, #FFB800 100%)",
+        "tape_text": "#080808",
+        "tape_stroke": "0px transparent",
+        "tape_border": "#000000",
+        "accent_glow": "rgba(255, 214, 0, 0.36)",
+        "frame_border": "#FFD600",
+    },
+    {
+        "name": "crimson_shock",
+        "badge_bg": "linear-gradient(135deg, #101218 0%, #1E2230 100%)",
+        "badge_text": "#FFE600",
+        "badge_border": "#FFE600",
+        "badge_glow": "rgba(255, 214, 0, 0.55)",
+        "tape_bg": "linear-gradient(135deg, #FF0F39 0%, #D6002A 100%)",
+        "tape_text": "#FFFFFF",
+        "tape_stroke": "6px #000000",
+        "tape_border": "#FFFFFF",
+        "accent_glow": "rgba(255, 15, 57, 0.40)",
+        "frame_border": "#FF1744",
+    },
+    {
+        "name": "neon_emerald",
+        "badge_bg": "linear-gradient(135deg, #FF1744 0%, #FF6D00 100%)",
+        "badge_text": "#FFFFFF",
+        "badge_border": "#FFFFFF",
+        "badge_glow": "rgba(255, 23, 68, 0.65)",
+        "tape_bg": "linear-gradient(135deg, #69F0AE 0%, #00E676 100%)",
+        "tape_text": "#05140B",
+        "tape_stroke": "0px transparent",
+        "tape_border": "#000000",
+        "accent_glow": "rgba(0, 230, 118, 0.32)",
+        "frame_border": "#00E676",
+    },
+    {
+        "name": "electric_cyan",
+        "badge_bg": "linear-gradient(135deg, #7C4DFF 0%, #D500F9 100%)",
+        "badge_text": "#FFFFFF",
+        "badge_border": "#FFFFFF",
+        "badge_glow": "rgba(213, 0, 249, 0.65)",
+        "tape_bg": "linear-gradient(135deg, #18FFFF 0%, #00E5FF 100%)",
+        "tape_text": "#041016",
+        "tape_stroke": "0px transparent",
+        "tape_border": "#000000",
+        "accent_glow": "rgba(0, 229, 255, 0.34)",
+        "frame_border": "#00E5FF",
+    },
+]
+
 
 def get_google_services():
     creds = Credentials(
@@ -69,6 +122,7 @@ def get_google_services():
     youtube = build("youtube", "v3", credentials=creds)
     return drive, youtube
 
+
 def load_uploaded_ids():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -79,9 +133,11 @@ def load_uploaded_ids():
             return data if isinstance(data, list) else []
     return []
 
+
 def save_uploaded_ids(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(ids, f, indent=2)
+
 
 def clean_title(title, fallback_title):
     raw = str(title or fallback_title).replace("<", "").replace(">", "")
@@ -91,7 +147,6 @@ def clean_title(title, fallback_title):
     if len(title) <= 100:
         return title
 
-    # টাইটেল ১০০ ক্যারেক্টারের বেশি হলে শেষের #হ্যাশট্যাগ ঠিক রেখে মূল অংশ ছোট করবে
     parts = title.split(" ")
     hashtags = []
     while parts and parts[-1].startswith("#"):
@@ -106,6 +161,7 @@ def clean_title(title, fallback_title):
         return f"{trimmed_main} {tag_str}".strip()[:100]
 
     return title[:100].rsplit(" ", 1)[0].strip()
+
 
 def clean_tags(tags):
     if isinstance(tags, str):
@@ -125,6 +181,7 @@ def clean_tags(tags):
         total_len += len(t) + 2
     return cleaned or ["শিক্ষামূলক", "বাংলা টিউটোরিয়াল", "education"]
 
+
 def clean_description(description, fallback_title):
     text = str(description or fallback_title)
     text = text.replace("\\n", "\n").replace("\r\n", "\n")
@@ -134,25 +191,88 @@ def clean_description(description, fallback_title):
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
+
+def clean_hook_phrase(text, max_words=4, max_chars=24):
+    raw = re.sub(r"#\S+", "", str(text or "")).replace("<", "").replace(">", "")
+    raw = re.sub(r"\s+", " ", raw).strip(' "\'“”|-–—')
+    if not raw:
+        return ""
+    words = raw.split(" ")
+    if len(words) > max_words:
+        raw = " ".join(words[:max_words])
+    if len(raw) > max_chars:
+        cut = raw[:max_chars].rsplit(" ", 1)[0].strip()
+        raw = cut if len(cut) >= 6 else raw[:max_chars].strip()
+    return raw
+
+
+def build_hook_data(data_dict, clean_video_title):
+    default_badges = [
+        "🔥 ৯৯% মানুষ জানে না!",
+        "😱 অবিশ্বাস্য সত্য!",
+        "🚨 মারাত্মক ভুল!",
+        "🎯 গোপন কৌশল!",
+    ]
+    badge = clean_hook_phrase(data_dict.get("hook_badge", ""), max_words=4, max_chars=24)
+    if not badge:
+        badge = random.choice(default_badges)
+    elif not any(ord(ch) > 0x2600 for ch in badge):
+        badge = f"🔥 {badge}"
+
+    line1 = clean_hook_phrase(data_dict.get("hook_line1", ""), max_words=4, max_chars=22)
+    line2 = clean_hook_phrase(data_dict.get("hook_line2", ""), max_words=4, max_chars=22)
+
+    if not line1 or not line2:
+        stripped_title = re.sub(r"#\S+", "", clean_video_title)
+        stripped_title = re.sub(r"\s+", " ", stripped_title).strip(" |-–—!?")
+        parts = [p.strip() for p in re.split(r"[|!?।:—–-]+", stripped_title) if p.strip()]
+        if len(parts) >= 2:
+            line1 = line1 or clean_hook_phrase(parts[0], max_words=3, max_chars=20)
+            line2 = line2 or (clean_hook_phrase(parts[1], max_words=4, max_chars=22) + "!")
+        else:
+            words = stripped_title.split()
+            mid = max(1, min(3, len(words) // 2 or 1))
+            line1 = line1 or clean_hook_phrase(" ".join(words[:mid]), max_words=3, max_chars=20)
+            rem = " ".join(words[mid:]) if len(words) > mid else "এখনই জেনে নিন!"
+            line2 = line2 or clean_hook_phrase(rem, max_words=4, max_chars=22)
+
+    if not line1:
+        line1 = "সফল হতে চাইলে"
+    if not line2:
+        line2 = "এই ১টি কাজ করুন!"
+    if not line2.endswith(("!", "?", "।")):
+        line2 = f"{line2}!"
+
+    return {"badge": badge, "line1": line1, "line2": line2}
+
+
 def parse_metadata_json(raw_text, fallback_title):
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
-    cleaned = re.sub(r"^```json\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
 
     try:
-        data = json.loads(cleaned)
+        data = json.loads(cleaned, strict=False)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if not match:
             raise
-        data = json.loads(match.group(0))
+        data = json.loads(match.group(0), strict=False)
 
     title = clean_title(data.get("title", fallback_title), fallback_title)
     description = clean_description(data.get("description", fallback_title), fallback_title)
     tags = clean_tags(data.get("tags"))
-    return title, description, tags
+    hooks = build_hook_data(data, title)
+    return title, description, tags, hooks
+
 
 def get_available_gemini_models(headers):
-    fallback_models = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+    fallback_models = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+    ]
     try:
         res = requests.get(
             "https://generativelanguage.googleapis.com/v1beta/models",
@@ -214,6 +334,7 @@ def get_available_gemini_models(headers):
         print(f"[Gemini Models List] Exception: {e}")
         return fallback_models
 
+
 def generate_with_gemini(prompt, fallback_title):
     if not GEMINI_API_KEY:
         print("GEMINI_API_KEY is not set in GitHub Secrets. Skipping Gemini.")
@@ -221,21 +342,21 @@ def generate_with_gemini(prompt, fallback_title):
 
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
+        "x-goog-api-key": GEMINI_API_KEY,
     }
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"}
+        "generationConfig": {"responseMimeType": "application/json"},
     }
 
     models = get_available_gemini_models(headers)
-    max_rounds = 3  # Gemini-তে মোট ৩ বার চেষ্টা করবে
+    max_rounds = 3
 
     for attempt in range(1, max_rounds + 1):
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=30)
+                res = requests.post(url, headers=headers, json=payload, timeout=35)
                 if res.status_code != 200:
                     print(f"[Gemini {attempt}/{max_rounds} | {model}] API Error {res.status_code}: {res.text[:200]}")
                     continue
@@ -263,6 +384,7 @@ def generate_with_gemini(prompt, fallback_title):
             time.sleep(wait_seconds)
 
     return None
+
 
 def get_available_groq_models(headers):
     try:
@@ -314,6 +436,7 @@ def get_available_groq_models(headers):
         print(f"[Groq Models List] Exception: {e}")
         return []
 
+
 def generate_with_groq(prompt, fallback_title):
     if not GROQ_API_KEY:
         print("GROQ_API_KEY is not set in GitHub Secrets. Skipping Groq fallback.")
@@ -323,7 +446,7 @@ def generate_with_groq(prompt, fallback_title):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GROQ_API_KEY}"
+        "Authorization": f"Bearer {GROQ_API_KEY}",
     }
 
     groq_models = get_available_groq_models(headers)
@@ -338,17 +461,16 @@ def generate_with_groq(prompt, fallback_title):
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert Bengali YouTube SEO strategist and content writer. "
-                        "Always respond strictly with valid JSON containing keys: title, description, tags. "
-                        "Write a rich, detailed, visually well-formatted Bengali YouTube description following every section, divider, bullet, and hashtag rule."
-                    )
+                        "You are an expert Bengali YouTube SEO strategist and viral thumbnail hook copywriter. "
+                        "Always respond strictly with valid JSON containing keys: title, description, tags, hook_badge, hook_line1, hook_line2."
+                    ),
                 },
                 {
                     "role": "user",
-                    "content": prompt
-                }
+                    "content": prompt,
+                },
             ],
-            "temperature": 0.7
+            "temperature": 0.7,
         }
 
         for use_json_mode in (True, False):
@@ -357,7 +479,7 @@ def generate_with_groq(prompt, fallback_title):
                 payload["response_format"] = {"type": "json_object"}
 
             try:
-                res = requests.post(url, headers=headers, json=payload, timeout=30)
+                res = requests.post(url, headers=headers, json=payload, timeout=35)
                 if res.status_code == 400 and use_json_mode:
                     continue
                 if res.status_code != 200:
@@ -374,52 +496,405 @@ def generate_with_groq(prompt, fallback_title):
 
     return None
 
+
 def generate_seo_metadata(filename):
     fallback_title = os.path.splitext(filename)[0].strip()
     prompt = (
-        "You are a top Bengali YouTube SEO expert and professional content writer for an educational channel. "
-        "Based on the video filename below, generate highly optimized, engaging YouTube metadata:\n\n"
+        "You are a top Bengali YouTube SEO expert and viral thumbnail hook copywriter for an educational channel. "
+        "Based on the video filename below, generate highly optimized YouTube metadata AND scroll-stopping thumbnail hook text:\n\n"
         "1. title:\n"
-        "   - Write a highly clickable (high-CTR), search-optimized Bengali YouTube title that sparks curiosity while staying clear and accurate.\n"
-        "   - Place the primary Bengali search keyword right within the first 3 to 5 words so it ranks strongly in YouTube Search.\n"
-        "   - Use a clean, natural structure when appropriate (e.g., 'মূল কিওয়ার্ড | আকর্ষণীয় প্রশ্ন বা চমকপ্রদ তথ্য!' or a crisp, punchy single phrase in natural Bengali—never robotic literal translation).\n"
-        "   - MUST include 2 to 3 short, relevant hashtags right at the end of the title (e.g., #shorts #learn #bangla or #shorts #বাংলা + 1 short topic hashtag).\n"
-        "   - Keep the ENTIRE title (Bengali text + hashtags combined) between 55 and 92 characters (strictly under 95 characters) so nothing gets cut off.\n\n"
+        "   - Write a highly clickable (high-CTR), search-optimized Bengali YouTube title that sparks intense curiosity.\n"
+        "   - Place the primary Bengali search keyword right within the first 3 to 5 words.\n"
+        "   - MUST include 2 to 3 short, relevant hashtags right at the end of the title (e.g., #shorts #learn #bangla).\n"
+        "   - Keep the ENTIRE title between 55 and 92 characters (strictly under 95 characters).\n\n"
         "2. description:\n"
-        "   - Write a rich, comprehensive, visually attractive, and deeply SEO-optimized YouTube description (around 220 to 350 words) strictly in natural, fluent Bengali.\n"
-        "   - Follow this exact clean visual layout using blank lines (\\n\\n) and thin dividers (━━━━━━━━━━━━━━━━━━━━) so it looks polished and easy to read on YouTube:\n\n"
-        "     * আকর্ষণীয় ওপেনিং হুক (3-4 lines, no heading): Start immediately with an engaging hook containing the primary Bengali search keywords in the first 2 lines (visible above 'More'), explaining clearly what the topic is and why watching this video matters.\n\n"
+        "   - Write a rich, comprehensive, visually attractive Bengali YouTube description (around 220 to 350 words) using blank lines (\\n\\n) and thin dividers (━━━━━━━━━━━━━━━━━━━━):\n"
+        "     * আকর্ষণীয় ওপেনিং হুক (3-4 lines, no heading) containing primary keywords.\n"
         "     ━━━━━━━━━━━━━━━━━━━━\n"
-        "     📖 ভিডিওর বিস্তারিত আলোচনা:\n"
-        "     Write a clear, informative 4 to 6 line paragraph explaining the concept in simple, engaging Bengali, naturally weaving in secondary and long-tail Bengali search phrases.\n\n"
-        "     📌 এই ভিডিও থেকে যা যা শিখবেন:\n"
-        "     Write 5 to 6 well-explained bullet points (each starting with ✅ on a new line) highlighting the key lessons, facts, or practical takeaways.\n\n"
-        "     💡 কেন এই বিষয়টি জানা জরুরি:\n"
-        "     Write 2 to 3 lines explaining how this knowledge helps students, learners, or curious viewers in real life or studies.\n\n"
+        "     📖 ভিডিওর বিস্তারিত আলোচনা: (4 to 6 lines in engaging Bengali)\n"
+        "     📌 এই ভিডিও থেকে যা যা শিখবেন: (5 to 6 bullet points starting with ✅)\n"
+        "     💡 কেন এই বিষয়টি জানা জরুরি: (2 to 3 lines)\n"
         "     ━━━━━━━━━━━━━━━━━━━━\n"
-        "     🔔 আমাদের সাথে যুক্ত থাকুন:\n"
-        "     Write a warm, friendly 2 to 3 line Bengali Call-to-Action inviting viewers to Like (👍) the video, share their thoughts or questions in the Comments (💬), Share with friends, and Subscribe to the channel for regular educational videos.\n\n"
-        "     * Hashtags Line (at the bottom): Include 8 to 10 relevant hashtags on the final line (must include #shorts #learn #bangla #শিক্ষামূলক plus topic-specific Bangla & English hashtags).\n"
-        "   - Never use angle brackets (< or >). Avoid spammy comma-separated raw keyword dumps inside the description.\n\n"
+        "     🔔 আমাদের সাথে যুক্ত থাকুন: (2 to 3 lines warm Bengali CTA)\n"
+        "     * Hashtags Line at the bottom: 8 to 10 relevant hashtags (#shorts #learn #bangla #শিক্ষামূলক etc.).\n"
+        "   - Never use angle brackets (< or >).\n\n"
         "3. tags:\n"
-        "   - A JSON list of 15 to 18 high-search-volume YouTube tags (without # symbol).\n"
-        "   - Mix natural Bengali search terms, popular Banglish search queries (used by Bangladeshi viewers), and a few relevant English educational keywords.\n\n"
-        "Strict Language Rule: Regardless of whether the video filename is in English, Bangla, or Banglish, ALWAYS write the title text and the entire description prose strictly in natural, fluent, standard Bengali.\n"
-        "Return ONLY valid JSON with exact keys: title, description, tags.\n\n"
+        "   - A JSON list of 15 to 18 high-search-volume YouTube tags (without # symbol), mixing Bengali, Banglish, and English.\n\n"
+        "4. VIRAL THUMBNAIL HOOK TEXT (CRITICAL - Must make every viewer freeze and click instantly!):\n"
+        "   - hook_badge: 2 to 3 ultra-punchy Bengali curiosity/shock words starting with ONE emoji from [🔥, 😱, 🚨, 🎯] (e.g., '🔥 ৯৯% মানুষ জানে না!', '😱 মারাত্মক ভুল!', '🎯 গোপন কৌশল!'). Max 20 characters.\n"
+        "   - hook_line1: 2 to 3 short, bold Bengali words creating tension, question, or problem (e.g., 'আত্মবিশ্বাসের ভয়?', 'ইংরেজিতে কথা বলুন', 'স্বপ্ন পূরণের পথে'). Max 18 characters, NO hashtags.\n"
+        "   - hook_line2: 2 to 4 explosive Bengali payoff/climax words ending with '!' or '?' (e.g., '১ মিনিটে জয় করুন!', 'কোনো ভয় ছাড়াই!', 'এই ১টি কাজ করুন!'). Max 20 characters, NO hashtags.\n\n"
+        "Strict Language Rule: ALWAYS write title, description, and hook fields strictly in natural, punchy Bengali.\n"
+        "Return ONLY valid JSON with exact keys: title, description, tags, hook_badge, hook_line1, hook_line2.\n\n"
         f"Video Filename: {filename}"
     )
 
-    # ১. প্রথমে Gemini API দিয়ে ৩ বার চেষ্টা করবে
     result = generate_with_gemini(prompt, fallback_title)
     if result is not None:
         return result
 
-    # ২. Gemini ৩ বার ফেইল করলে Groq-এর অ্যাক্টিভ মডেল ব্যবহার করবে
     result = generate_with_groq(prompt, fallback_title)
     if result is not None:
         return result
 
     return None
+
+
+def inspect_video_specs(video_path):
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json",
+            video_path,
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return 1080, 1920, 30.0
+        info = json.loads(out.stdout)
+        streams = info.get("streams", [])
+        width = int(streams[0].get("width", 1080)) if streams else 1080
+        height = int(streams[0].get("height", 1920)) if streams else 1920
+        duration = float(info.get("format", {}).get("duration", 30.0))
+        return width, height, max(duration, 1.0)
+    except Exception:
+        return 1080, 1920, 30.0
+
+
+def score_candidate_frame(img):
+    """Scores a candidate video frame on subject-zone sharpness, exposure balance, and vibrancy."""
+    small = img.convert("RGB")
+    small.thumbnail((480, 480))
+    w, h = small.size
+
+    # Focus on upper-center subject/face zone (15%..85% x, 8%..62% y)
+    subject_box = (int(w * 0.15), int(h * 0.08), int(w * 0.85), int(h * 0.62))
+    subject = small.crop(subject_box)
+
+    gray = subject.convert("L")
+    stat = ImageStat.Stat(gray)
+    mean_lum = stat.mean[0]
+    contrast = stat.stddev[0]
+
+    # Penalize very dark or blown-out white frames
+    if mean_lum < 32 or mean_lum > 232:
+        exposure_weight = 0.25
+    elif 65 <= mean_lum <= 185:
+        exposure_weight = 1.0
+    else:
+        exposure_weight = 0.65
+
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    sharpness = ImageStat.Stat(edges).mean[0]
+
+    hsv = subject.convert("HSV")
+    saturation = ImageStat.Stat(hsv).mean[1]
+
+    return (sharpness * 2.4 + contrast * 0.9 + saturation * 0.35) * exposure_weight
+
+
+def extract_best_video_frame(video_path, duration, work_dir):
+    ratios = [0.14, 0.22, 0.30, 0.38, 0.48, 0.58, 0.68, 0.78]
+    best_path = None
+    best_score = -1.0
+
+    for idx, r in enumerate(ratios):
+        ts = max(0.2, min(duration - 0.2, duration * r))
+        frame_path = os.path.join(work_dir, f"cand_{idx}.jpg")
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{ts:.2f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-q:v", "2",
+            frame_path,
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=15)
+            if os.path.exists(frame_path) and os.path.getsize(frame_path) > 1000:
+                with Image.open(frame_path) as im:
+                    sc = score_candidate_frame(im)
+                if sc > best_score:
+                    best_score = sc
+                    best_path = frame_path
+        except Exception:
+            continue
+
+    return best_path
+
+
+def find_headless_browser():
+    candidates = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium-browser",
+        "chromium",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for c in candidates:
+        if os.path.isabs(c) and os.path.exists(c):
+            return c
+        found = shutil.which(c)
+        if found:
+            return found
+    return None
+
+
+def build_viral_thumbnail_html(bg_data_uri, hook_data, width, height, theme):
+    is_portrait = height >= width
+    badge_esc = html.escape(hook_data["badge"])
+    line1_esc = html.escape(hook_data["line1"])
+    line2_esc = html.escape(hook_data["line2"])
+
+    len1 = len(hook_data["line1"])
+    len2 = len(hook_data["line2"])
+
+    if is_portrait:
+        l1_size = 112 if len1 <= 12 else (96 if len1 <= 16 else (82 if len1 <= 21 else 68))
+        l2_size = 102 if len2 <= 13 else (88 if len2 <= 17 else (74 if len2 <= 22 else 62))
+        badge_size = 46
+        stroke_px = 14
+        layout_css = f"""
+        .hook-wrap {{
+            position: absolute;
+            left: 42px;
+            right: 42px;
+            bottom: 195px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            z-index: 10;
+        }}
+        .scrim {{
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(ellipse at 50% 82%, {theme['accent_glow']} 0%, transparent 52%),
+                linear-gradient(180deg,
+                    rgba(0,0,0,0.18) 0%,
+                    rgba(0,0,0,0.00) 18%,
+                    rgba(0,0,0,0.00) 50%,
+                    rgba(4,6,14,0.68) 63%,
+                    rgba(3,4,10,0.93) 77%,
+                    rgba(2,3,8,0.98) 100%);
+            z-index: 2;
+        }}
+        """
+    else:
+        l1_size = 80 if len1 <= 14 else (68 if len1 <= 19 else 56)
+        l2_size = 76 if len2 <= 15 else (64 if len2 <= 20 else 52)
+        badge_size = 35
+        stroke_px = 11
+        layout_css = f"""
+        .hook-wrap {{
+            position: absolute;
+            left: 52px;
+            right: 52px;
+            bottom: 44px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            text-align: left;
+            z-index: 10;
+        }}
+        .scrim {{
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(ellipse at 28% 82%, {theme['accent_glow']} 0%, transparent 50%),
+                linear-gradient(180deg,
+                    rgba(0,0,0,0.12) 0%,
+                    rgba(0,0,0,0.00) 36%,
+                    rgba(4,6,14,0.78) 68%,
+                    rgba(2,3,8,0.96) 100%);
+            z-index: 2;
+        }}
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anek+Bangla:wght@800&family=Baloo+Da+2:wght@800&family=Hind+Siliguri:wght@700&family=Noto+Color+Emoji&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{
+    width: {width}px;
+    height: {height}px;
+    overflow: hidden;
+    background: #05070e;
+    font-family: 'Baloo Da 2', 'Anek Bangla', 'Hind Siliguri', 'Noto Sans Bengali', 'Noto Color Emoji', sans-serif;
+  }}
+  .canvas {{
+    position: relative;
+    width: {width}px;
+    height: {height}px;
+    overflow: hidden;
+  }}
+  .bg-img {{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center 18%;
+    transform: scale(1.04);
+    filter: contrast(1.15) saturate(1.26) brightness(1.04);
+    z-index: 1;
+  }}
+  .frame {{
+    position: absolute;
+    inset: 0;
+    box-shadow: inset 0 0 110px rgba(0,0,0,0.55);
+    border: 8px solid {theme['frame_border']};
+    z-index: 4;
+    pointer-events: none;
+  }}
+  {layout_css}
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: {theme['badge_bg']};
+    color: {theme['badge_text']};
+    font-size: {badge_size}px;
+    font-weight: 800;
+    line-height: 1.15;
+    padding: 12px 36px 10px 36px;
+    border-radius: 999px;
+    border: 4px solid {theme['badge_border']};
+    box-shadow: 0 10px 30px {theme['badge_glow']}, 0 6px 0 #000000;
+    transform: rotate(-2deg);
+    margin-bottom: 20px;
+  }}
+  .line1 {{
+    color: #FFFFFF;
+    font-size: {l1_size}px;
+    font-weight: 800;
+    line-height: 1.14;
+    paint-order: stroke fill;
+    -webkit-text-stroke: {stroke_px}px #000000;
+    text-shadow: 0 6px 0 #000000, 0 12px 24px rgba(0,0,0,0.95);
+    margin-bottom: 16px;
+    max-width: 100%;
+  }}
+  .tape {{
+    display: inline-block;
+    background: {theme['tape_bg']};
+    border: 5px solid {theme['tape_border']};
+    border-radius: 22px;
+    padding: 12px 36px 8px 36px;
+    box-shadow: 0 12px 0 #000000, 0 20px 42px rgba(0,0,0,0.92);
+    transform: rotate(-1.4deg);
+    max-width: 100%;
+  }}
+  .line2 {{
+    color: {theme['tape_text']};
+    font-size: {l2_size}px;
+    font-weight: 800;
+    line-height: 1.14;
+    paint-order: stroke fill;
+    -webkit-text-stroke: {theme['tape_stroke']};
+  }}
+</style>
+</head>
+<body>
+  <div class="canvas">
+    <img class="bg-img" src="{bg_data_uri}" alt="" />
+    <div class="scrim"></div>
+    <div class="frame"></div>
+    <div class="hook-wrap">
+      <div class="badge">{badge_esc}</div>
+      <div class="line1">{line1_esc}</div>
+      <div class="tape">
+        <div class="line2">{line2_esc}</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def save_optimized_jpeg(img, dest_path, max_bytes=1900000):
+    rgb = img.convert("RGB")
+    for quality in (93, 88, 82, 75):
+        rgb.save(dest_path, "JPEG", quality=quality, subsampling=0, optimize=True)
+        if os.path.getsize(dest_path) <= max_bytes:
+            return
+    rgb.save(dest_path, "JPEG", quality=70, optimize=True)
+
+
+def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
+    vid_w, vid_h, duration = inspect_video_specs(video_path)
+    is_portrait = vid_h >= vid_w
+    target_w, target_h = (1080, 1920) if is_portrait else (1280, 720)
+    theme = random.choice(VIRAL_THUMB_THEMES)
+
+    work_dir = tempfile.mkdtemp(prefix="yt_thumb_")
+    try:
+        best_frame = extract_best_video_frame(video_path, duration, work_dir)
+        if not best_frame:
+            fallback_img = Image.new("RGB", (target_w, target_h), (18, 24, 42))
+            best_frame = os.path.join(work_dir, "fallback.jpg")
+            fallback_img.save(best_frame, "JPEG", quality=90)
+
+        with open(best_frame, "rb") as bf:
+            data_uri = "data:image/jpeg;base64," + base64.b64encode(bf.read()).decode("ascii")
+
+        browser = find_headless_browser()
+        if browser:
+            html_path = os.path.join(work_dir, "thumb.html")
+            png_path = os.path.join(work_dir, "thumb.png")
+            html_content = build_viral_thumbnail_html(data_uri, hook_data, target_w, target_h, theme)
+            with open(html_path, "w", encoding="utf-8") as hf:
+                hf.write(html_content)
+
+            file_url = "file:///" + os.path.abspath(html_path).replace("\\", "/")
+            cmd = [
+                browser,
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--hide-scrollbars",
+                "--force-device-scale-factor=1",
+                f"--window-size={target_w},{target_h}",
+                "--virtual-time-budget=4000",
+                f"--screenshot={png_path}",
+                file_url,
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=40)
+            if os.path.exists(png_path) and os.path.getsize(png_path) > 5000:
+                with Image.open(png_path) as rendered:
+                    cropped = rendered.convert("RGB").crop((0, 0, target_w, target_h))
+                    save_optimized_jpeg(cropped, dest_thumb_path)
+                print(
+                    f"Viral hook thumbnail generated ({target_w}x{target_h}, theme={theme['name']}, "
+                    f"size={os.path.getsize(dest_thumb_path) // 1024}KB)."
+                )
+                return True
+
+        # Fallback: enhanced best video frame if headless browser is unavailable
+        with Image.open(best_frame) as im:
+            im = im.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+            im = ImageEnhance.Contrast(im).enhance(1.18)
+            im = ImageEnhance.Color(im).enhance(1.25)
+            save_optimized_jpeg(im, dest_thumb_path)
+        print("Fallback enhanced frame thumbnail generated.")
+        return True
+    except Exception as e:
+        print(f"[Warning] Thumbnail generation failed: {e}")
+        return False
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
 
 def download_video(drive, file_id, dest_path):
     request = drive.files().get_media(fileId=file_id)
@@ -433,22 +908,23 @@ def download_video(drive, file_id, dest_path):
     if not os.path.exists(dest_path) or os.path.getsize(dest_path) <= 0:
         raise RuntimeError("Downloaded video file is empty (0 bytes).")
 
+
 def upload_to_youtube(youtube, video_path, title, description, tags):
     body = {
         "snippet": {
             "title": title,
             "description": description,
             "tags": tags,
-            "categoryId": "27"  # 27 = Education
+            "categoryId": "27",
         },
         "status": {
-            "privacyStatus": "public",          # সরাসরি পাবলিক হিসেবে আপলোড হবে
-            "selfDeclaredMadeForKids": False,   # No, it's not made for kids
-            "containsSyntheticMedia": False     # AI use: No
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+            "containsSyntheticMedia": False,
         },
         "paidProductPlacementDetails": {
-            "hasPaidProductPlacement": False    # Paid promotion: No
-        }
+            "hasPaidProductPlacement": False,
+        },
     }
     media = MediaFileUpload(video_path, chunksize=5 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(
@@ -462,7 +938,43 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
         status, response = request.next_chunk()
         if status:
             print(f"Uploading to YouTube: {int(status.progress() * 100)}%")
-    print(f"Published! Video ID: {response.get('id')}")
+    video_id = response.get("id")
+    print(f"Published! Video ID: {video_id}")
+    return video_id
+
+
+def wait_for_youtube_processing(youtube, video_id, max_wait_sec=65):
+    """Waits briefly for Shorts/video processing to finish so custom thumbnail is not overwritten."""
+    elapsed = 0
+    interval = 5
+    while elapsed < max_wait_sec:
+        try:
+            resp = youtube.videos().list(part="processingDetails", id=video_id).execute()
+            items = resp.get("items", [])
+            if items:
+                status = items[0].get("processingDetails", {}).get("processingStatus", "")
+                if status in ("succeeded", "failed", "terminated"):
+                    print(f"YouTube processing status: {status} (after {elapsed}s)")
+                    return status
+        except Exception as e:
+            print(f"[Info] Processing status check warning: {e}")
+            break
+        time.sleep(interval)
+        elapsed += interval
+    return "processing"
+
+
+def set_youtube_thumbnail(youtube, video_id, thumb_path):
+    if not video_id or not os.path.exists(thumb_path):
+        return
+    wait_for_youtube_processing(youtube, video_id)
+    try:
+        media = MediaFileUpload(thumb_path, mimetype="image/jpeg", resumable=False)
+        youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+        print(f"Custom viral thumbnail applied to YouTube video {video_id}!")
+    except Exception as e:
+        print(f"[Warning] Could not apply custom YouTube thumbnail (check if channel is phone-verified): {e}")
+
 
 def list_drive_videos(drive, folder_id):
     query = f"'{folder_id}' in parents and mimeType contains 'video/' and trashed = false"
@@ -486,6 +998,7 @@ def list_drive_videos(drive, folder_id):
 
     return files
 
+
 def extract_folder_id(raw_value):
     val = str(raw_value or "").strip()
     low = val.lower()
@@ -496,6 +1009,7 @@ def extract_folder_id(raw_value):
         if match:
             return match.group(1)
     return val if re.fullmatch(r"[a-zA-Z0-9_-]+", val) else ""
+
 
 def get_configured_folders():
     active = []
@@ -521,6 +1035,7 @@ def get_configured_folders():
 
     return active
 
+
 def append_attribution(description, attribution):
     base_desc = str(description or "").strip()
     attr_text = str(attribution or "").replace("<", "").replace(">", "").strip()
@@ -529,6 +1044,7 @@ def append_attribution(description, attribution):
     max_base_len = max(0, 5000 - len(attr_text) - 2)
     trimmed_base = base_desc[:max_base_len].rstrip()
     return f"{trimmed_base}\n\n{attr_text}" if trimmed_base else attr_text[:5000]
+
 
 def main():
     configured_folders = get_configured_folders()
@@ -540,7 +1056,6 @@ def main():
     uploaded_ids = load_uploaded_ids()
     uploaded_set = set(uploaded_ids)
 
-    # ফোল্ডারগুলো র‍্যান্ডম অর্ডারে সাজিয়ে প্রথম যে ফোল্ডারে নতুন ভিডিও পাবে সেটি নেবে
     shuffled_folders = list(configured_folders)
     random.shuffle(shuffled_folders)
 
@@ -557,7 +1072,7 @@ def main():
         new_files = [f for f in files if f["id"] not in uploaded_set]
         if new_files:
             selected_folder = folder
-            selected_video = new_files[0]  # পুরনো থেকে নতুন ক্রমে প্রথম আন-আপলোডেড ভিডিও
+            selected_video = new_files[0]
             break
         print(f"No new videos in Folder #{folder['index']} ({folder_id}). Checking next folder...")
 
@@ -568,7 +1083,8 @@ def main():
     file_id = selected_video["id"]
     file_name = selected_video["name"]
     attribution = selected_folder["attribution"]
-    temp_path = "/tmp/temp_video.mp4"
+    temp_path = os.path.join(tempfile.gettempdir(), "temp_video.mp4")
+    thumb_path = os.path.join(tempfile.gettempdir(), "temp_thumb.jpg")
 
     print(f"\nSelected Folder #{selected_folder['index']} ({selected_folder['folder_id']})")
     print(f"Processing: {file_name}")
@@ -578,21 +1094,27 @@ def main():
         print("Both Gemini and Groq APIs failed. Skipping upload for this run so it retries cleanly next time.")
         return
 
-    title, description, tags = metadata
+    title, description, tags, hook_data = metadata
     description = append_attribution(description, attribution)
     print(f"Generated Title: {title}")
+    print(f"Generated Thumbnail Hook: [{hook_data['badge']}] {hook_data['line1']} -> {hook_data['line2']}")
     if attribution:
         print(f"Appended Attribution: {attribution}")
 
     try:
         download_video(drive, file_id, temp_path)
-        upload_to_youtube(youtube, temp_path, title, description, tags)
+        thumb_ok = generate_viral_thumbnail(temp_path, thumb_path, hook_data)
+        video_id = upload_to_youtube(youtube, temp_path, title, description, tags)
+        if thumb_ok and video_id:
+            set_youtube_thumbnail(youtube, video_id, thumb_path)
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for p in (temp_path, thumb_path):
+            if os.path.exists(p):
+                os.remove(p)
 
     uploaded_ids.append(file_id)
     save_uploaded_ids(uploaded_ids)
+
 
 if __name__ == "__main__":
     main()
