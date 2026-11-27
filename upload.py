@@ -21,6 +21,7 @@ REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"].strip()
 FALLBACK_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+REPAIR_VIDEO_IDS = os.environ.get("REPAIR_VIDEO_IDS", "").strip()
 
 # ==============================================================================
 # GOOGLE DRIVE FOLDERS & ATTRIBUTION SETTINGS
@@ -562,12 +563,23 @@ def inspect_video_specs(video_path):
         return 1080, 1920, 30.0
 
 
+def estimate_skin_presence(rgb_crop):
+    """Estimates proportion of warm human skin-tone pixels so speaker faces beat B-roll objects."""
+    tiny = rgb_crop.resize((64, 64))
+    pixels = list(tiny.getdata())
+    skin_count = 0
+    for r, g, b in pixels:
+        if r > 90 and g > 40 and b > 20 and r > g and (r - g) >= 12 and (r - b) >= 20 and r < 248:
+            skin_count += 1
+    return skin_count / max(len(pixels), 1)
+
+
 def score_candidate_frame(img):
     small = img.convert("RGB")
     small.thumbnail((480, 480))
     w, h = small.size
 
-    subject_box = (int(w * 0.12), int(h * 0.12), int(w * 0.88), int(h * 0.55))
+    subject_box = (int(w * 0.14), int(h * 0.10), int(w * 0.86), int(h * 0.58))
     subject = small.crop(subject_box)
 
     gray = subject.convert("L")
@@ -588,11 +600,14 @@ def score_candidate_frame(img):
     hsv = subject.convert("HSV")
     saturation = ImageStat.Stat(hsv).mean[1]
 
-    return (sharpness * 2.4 + contrast * 0.9 + saturation * 0.35) * exposure_weight
+    skin_ratio = estimate_skin_presence(subject)
+    face_bonus = 1.0 + min(skin_ratio * 2.8, 0.95)
+
+    return (sharpness * 2.2 + contrast * 0.9 + saturation * 0.35) * exposure_weight * face_bonus
 
 
 def extract_best_video_frame(video_path, duration, work_dir):
-    ratios = [0.14, 0.22, 0.30, 0.38, 0.48, 0.58, 0.68, 0.78]
+    ratios = [0.08, 0.16, 0.24, 0.33, 0.42, 0.52, 0.62, 0.72, 0.82, 0.90]
     best_path = None
     best_score = -1.0
 
@@ -620,30 +635,21 @@ def extract_best_video_frame(video_path, duration, work_dir):
     return best_path
 
 
-def extract_clean_subject_for_youtube(img):
+def prepare_clean_frame(img, is_portrait_target):
     """
-    Prepares the sharpest speaker subject region for a full-bleed 1280x720 YouTube thumbnail:
-    - If vertical frame is a framed educational card (bright top header & bottom subtitle boxes
-      around an inner video window), automatically extracts the clean inner video window!
-    - If vertical frame is a full-bleed 9:16 video, crops the upper portrait half (face & shoulders).
-    - If already horizontal (16:9), returns full frame.
+    If a vertical video is a framed subtitle card (bright header & bottom subtitle cards around
+    an inner video box), extracts the clean speaker window so subtitle cards never clash with hook text!
     """
     rgb = img.convert("RGB")
     w, h = rgb.size
-    if w >= h:
-        return rgb, False  # Native landscape video
-
-    gray = rgb.convert("L")
-    top_lum = ImageStat.Stat(gray.crop((0, 0, w, int(h * 0.13)))).mean[0]
-    mid_lum = ImageStat.Stat(gray.crop((int(w * 0.08), int(h * 0.17), int(w * 0.92), int(h * 0.43)))).mean[0]
-    bot_lum = ImageStat.Stat(gray.crop((0, int(h * 0.50), w, int(h * 0.92)))).mean[0]
-
-    if top_lum > 185 and bot_lum > 185 and mid_lum < (min(top_lum, bot_lum) - 30):
-        inner = rgb.crop((int(w * 0.045), int(h * 0.158), int(w * 0.955), int(h * 0.442)))
-        return inner, True
-
-    portrait_upper = rgb.crop((0, int(h * 0.04), w, int(h * 0.65)))
-    return portrait_upper, True
+    if h > w:
+        gray = rgb.convert("L")
+        top_lum = ImageStat.Stat(gray.crop((0, 0, w, int(h * 0.13)))).mean[0]
+        mid_lum = ImageStat.Stat(gray.crop((int(w * 0.08), int(h * 0.17), int(w * 0.92), int(h * 0.43)))).mean[0]
+        bot_lum = ImageStat.Stat(gray.crop((0, int(h * 0.50), w, int(h * 0.92)))).mean[0]
+        if top_lum > 185 and bot_lum > 185 and mid_lum < (min(top_lum, bot_lum) - 30):
+            return rgb.crop((int(w * 0.045), int(h * 0.158), int(w * 0.955), int(h * 0.442))), True
+    return rgb, False
 
 
 def render_badge_with_twemoji(badge_text):
@@ -684,73 +690,97 @@ def find_headless_browser():
     return None
 
 
-def build_youtube_16x9_html(bg_data_uri, hook_data, use_split_hero, theme):
+def build_viral_thumbnail_html(bg_data_uri, hook_data, width, height, extracted_card_window, theme):
     """
-    Always builds a crisp 1280x720 (16:9) YouTube thumbnail so YouTube never adds ugly sidebars!
+    - For YouTube Shorts (1080x1920, 9:16): Full vertical viral hook card (YouTube Shorts crops & displays
+      9:16 directly on the Shorts tab/feed!).
+    - For Long Landscape YouTube Videos (1280x720, 16:9): Full horizontal viral hook card!
     """
+    is_portrait = height >= width
     badge_html = render_badge_with_twemoji(hook_data["badge"])
     line1_esc = html.escape(hook_data["line1"])
     line2_esc = html.escape(hook_data["line2"])
 
     len1 = len(hook_data["line1"])
     len2 = len(hook_data["line2"])
-    l1_size = 80 if len1 <= 13 else (68 if len1 <= 17 else (58 if len1 <= 22 else 48))
-    l2_size = 74 if len2 <= 14 else (64 if len2 <= 18 else (54 if len2 <= 23 else 46))
 
-    if use_split_hero:
-        media_layers = f"""
-        <img class="bg-ambient" src="{bg_data_uri}" alt="" />
-        <div class="subject-panel"><img class="subject-img" src="{bg_data_uri}" alt="" /></div>
-        <div class="split-scrim"></div>
-        """
-        media_css = f"""
-        .bg-ambient {{
-            position: absolute; inset: -40px; width: calc(100% + 80px); height: calc(100% + 80px);
-            object-fit: cover; filter: blur(26px) brightness(0.32) saturate(1.60); z-index: 1;
+    if is_portrait:
+        l1_size = 110 if len1 <= 12 else (94 if len1 <= 16 else (80 if len1 <= 21 else 66))
+        l2_size = 100 if len2 <= 13 else (86 if len2 <= 17 else (72 if len2 <= 22 else 60))
+        badge_size = 46
+        stroke_px = 14
+        if extracted_card_window:
+            bg_html = f"""
+            <img class="bg-blur" src="{bg_data_uri}" alt="" />
+            <div class="top-hero"><img class="hero-img" src="{bg_data_uri}" alt="" /></div>
+            """
+            bg_css = """
+            .bg-blur {
+                position: absolute; inset: -40px; width: calc(100% + 80px); height: calc(100% + 80px);
+                object-fit: cover; filter: blur(30px) brightness(0.28) saturate(1.6); z-index: 1;
+            }
+            .top-hero {
+                position: absolute; top: 0; left: 0; width: 100%; height: 68%; overflow: hidden; z-index: 2;
+                -webkit-mask-image: linear-gradient(to bottom, #000000 0%, #000000 68%, transparent 100%);
+                mask-image: linear-gradient(to bottom, #000000 0%, #000000 68%, transparent 100%);
+            }
+            .hero-img {
+                width: 100%; height: 100%; object-fit: cover; object-position: center 22%;
+                transform: scale(1.06); filter: contrast(1.16) saturate(1.26) brightness(1.05);
+            }
+            """
+        else:
+            bg_html = f'<img class="bg-img" src="{bg_data_uri}" alt="" />'
+            bg_css = """
+            .bg-img {
+                position: absolute; inset: 0; width: 100%; height: 100%;
+                object-fit: cover; object-position: center 18%; transform: scale(1.04);
+                filter: contrast(1.15) saturate(1.26) brightness(1.04); z-index: 1;
+            }
+            """
+        layout_css = f"""
+        {bg_css}
+        .hook-wrap {{
+            position: absolute; left: 42px; right: 42px; bottom: 195px;
+            display: flex; flex-direction: column; align-items: center; text-align: center; z-index: 10;
         }}
-        .subject-panel {{
-            position: absolute; top: 0; right: 0; width: 62%; height: 100%; overflow: hidden; z-index: 2;
-            -webkit-mask-image: linear-gradient(to right, transparent 0%, rgba(0,0,0,0.72) 18%, #000000 34%, #000000 100%);
-            mask-image: linear-gradient(to right, transparent 0%, rgba(0,0,0,0.72) 18%, #000000 34%, #000000 100%);
-        }}
-        .subject-img {{
-            width: 100%; height: 100%; object-fit: cover; object-position: center 22%;
-            transform: scale(1.06); filter: contrast(1.16) saturate(1.26) brightness(1.05);
-        }}
-        .split-scrim {{
+        .scrim {{
             position: absolute; inset: 0;
             background:
-                radial-gradient(circle at 26% 54%, {theme['accent_glow']} 0%, transparent 52%),
-                linear-gradient(90deg, rgba(4,6,15,0.97) 0%, rgba(4,6,15,0.90) 40%, rgba(4,6,15,0.32) 64%, rgba(4,6,15,0.04) 100%);
+                radial-gradient(ellipse at 50% 82%, {theme['accent_glow']} 0%, transparent 52%),
+                linear-gradient(180deg,
+                    rgba(0,0,0,0.16) 0%,
+                    rgba(0,0,0,0.00) 20%,
+                    rgba(0,0,0,0.00) 48%,
+                    rgba(4,6,14,0.72) 63%,
+                    rgba(3,4,10,0.94) 77%,
+                    rgba(2,3,8,0.99) 100%);
             z-index: 3;
-        }}
-        .hook-wrap {{
-            position: absolute; left: 50px; top: 50%; transform: translateY(-50%);
-            width: 60%; display: flex; flex-direction: column; align-items: flex-start; text-align: left; z-index: 10;
         }}
         """
     else:
-        media_layers = f"""
-        <img class="bg-full" src="{bg_data_uri}" alt="" />
-        <div class="full-scrim"></div>
-        """
-        media_css = f"""
-        .bg-full {{
+        l1_size = 80 if len1 <= 14 else (68 if len1 <= 19 else 56)
+        l2_size = 74 if len2 <= 15 else (64 if len2 <= 20 else 52)
+        badge_size = 35
+        stroke_px = 12
+        bg_html = f'<img class="bg-img" src="{bg_data_uri}" alt="" />'
+        layout_css = f"""
+        .bg-img {{
             position: absolute; inset: 0; width: 100%; height: 100%;
-            object-fit: cover; object-position: center 22%; transform: scale(1.04);
+            object-fit: cover; object-position: center 20%; transform: scale(1.04);
             filter: contrast(1.15) saturate(1.25) brightness(1.04); z-index: 1;
         }}
-        .full-scrim {{
+        .hook-wrap {{
+            position: absolute; left: 52px; right: 52px; bottom: 48px;
+            display: flex; flex-direction: column; align-items: flex-start; text-align: left; z-index: 10;
+        }}
+        .scrim {{
             position: absolute; inset: 0;
             background:
-                radial-gradient(ellipse at 26% 78%, {theme['accent_glow']} 0%, transparent 50%),
-                linear-gradient(90deg, rgba(3,5,12,0.92) 0%, rgba(3,5,12,0.68) 48%, rgba(3,5,12,0.10) 100%),
-                linear-gradient(180deg, rgba(0,0,0,0.08) 0%, rgba(2,3,8,0.88) 100%);
-            z-index: 2;
-        }}
-        .hook-wrap {{
-            position: absolute; left: 52px; bottom: 48px; width: 66%;
-            display: flex; flex-direction: column; align-items: flex-start; text-align: left; z-index: 10;
+                radial-gradient(ellipse at 28% 82%, {theme['accent_glow']} 0%, transparent 50%),
+                linear-gradient(90deg, rgba(3,5,12,0.90) 0%, rgba(3,5,12,0.62) 48%, rgba(3,5,12,0.10) 100%),
+                linear-gradient(180deg, rgba(0,0,0,0.08) 0%, rgba(2,3,8,0.90) 100%);
+            z-index: 3;
         }}
         """
 
@@ -764,38 +794,38 @@ def build_youtube_16x9_html(bg_data_uri, hook_data, use_split_hero, theme):
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   html, body {{
-    width: 1280px; height: 720px; overflow: hidden; background: #04060f;
+    width: {width}px; height: {height}px; overflow: hidden; background: #04060f;
     font-family: 'Baloo Da 2', 'Anek Bangla', 'Hind Siliguri', 'Noto Sans Bengali', 'Noto Color Emoji', sans-serif;
   }}
-  .canvas {{ position: relative; width: 1280px; height: 720px; overflow: hidden; }}
-  {media_css}
+  .canvas {{ position: relative; width: {width}px; height: {height}px; overflow: hidden; }}
+  {layout_css}
   .frame {{
     position: absolute; inset: 0;
-    box-shadow: inset 0 0 85px rgba(0,0,0,0.55);
-    border: 7px solid {theme['frame_border']}; z-index: 5; pointer-events: none;
+    box-shadow: inset 0 0 100px rgba(0,0,0,0.55);
+    border: 8px solid {theme['frame_border']}; z-index: 5; pointer-events: none;
   }}
   .badge {{
     display: inline-flex; align-items: center; gap: 12px;
     background: {theme['badge_bg']}; color: {theme['badge_text']};
-    font-size: 35px; font-weight: 800; line-height: 1.15;
-    padding: 10px 30px 8px 30px; border-radius: 999px;
-    border: 3.5px solid {theme['badge_border']};
-    box-shadow: 0 10px 28px {theme['badge_glow']}, 0 5px 0 #000000;
-    transform: rotate(-1.8deg); margin-bottom: 20px;
+    font-size: {badge_size}px; font-weight: 800; line-height: 1.15;
+    padding: 12px 36px 10px 36px; border-radius: 999px;
+    border: 4px solid {theme['badge_border']};
+    box-shadow: 0 10px 30px {theme['badge_glow']}, 0 6px 0 #000000;
+    transform: rotate(-2deg); margin-bottom: 20px;
   }}
-  .emoji-icon {{ width: 38px; height: 38px; flex-shrink: 0; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.45)); }}
+  .emoji-icon {{ width: {badge_size + 2}px; height: {badge_size + 2}px; flex-shrink: 0; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.45)); }}
   .line1 {{
     color: #FFFFFF; font-size: {l1_size}px; font-weight: 800; line-height: 1.14;
-    paint-order: stroke fill; -webkit-text-stroke: 12px #000000;
+    paint-order: stroke fill; -webkit-text-stroke: {stroke_px}px #000000;
     text-shadow: 0 6px 0 #000000, 0 12px 24px rgba(0,0,0,0.95);
-    margin-bottom: 18px; max-width: 100%;
+    margin-bottom: 16px; max-width: 100%;
   }}
   .tape {{
     display: inline-block; background: {theme['tape_bg']};
-    border: 4.5px solid {theme['tape_border']}; border-radius: 20px;
-    padding: 10px 30px 6px 30px;
-    box-shadow: 0 10px 0 #000000, 0 18px 36px rgba(0,0,0,0.92);
-    transform: rotate(-1.2deg); max-width: 100%;
+    border: 5px solid {theme['tape_border']}; border-radius: 22px;
+    padding: 12px 36px 8px 36px;
+    box-shadow: 0 12px 0 #000000, 0 20px 42px rgba(0,0,0,0.92);
+    transform: rotate(-1.4deg); max-width: 100%;
   }}
   .line2 {{
     color: {theme['tape_text']}; font-size: {l2_size}px; font-weight: 800; line-height: 1.14;
@@ -805,7 +835,8 @@ def build_youtube_16x9_html(bg_data_uri, hook_data, use_split_hero, theme):
 </head>
 <body>
   <div class="canvas">
-    {media_layers}
+    {bg_html}
+    <div class="scrim"></div>
     <div class="frame"></div>
     <div class="hook-wrap">
       <div class="badge">{badge_html}</div>
@@ -827,8 +858,11 @@ def save_optimized_jpeg(img, dest_path, max_bytes=1900000):
 
 
 def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
-    _, _, duration = inspect_video_specs(video_path)
-    target_w, target_h = 1280, 720  # YouTube thumbnails.set always expects 16:9 (1280x720)
+    vid_w, vid_h, duration = inspect_video_specs(video_path)
+    is_portrait = vid_h >= vid_w
+    # Shorts (9:16) MUST receive 1080x1920 so YouTube Shorts doesn't crop the left/right edges!
+    # Long landscape videos (16:9) receive 1280x720!
+    target_w, target_h = (1080, 1920) if is_portrait else (1280, 720)
     theme = random.choice(VIRAL_THUMB_THEMES)
 
     work_dir = tempfile.mkdtemp(prefix="yt_thumb_")
@@ -840,9 +874,9 @@ def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
             fallback_img.save(best_frame, "JPEG", quality=92)
 
         with Image.open(best_frame) as raw_im:
-            subject_im, use_split_hero = extract_clean_subject_for_youtube(raw_im)
+            clean_im, extracted_card_window = prepare_clean_frame(raw_im, is_portrait)
             subject_path = os.path.join(work_dir, "subject.jpg")
-            subject_im.save(subject_path, "JPEG", quality=95)
+            clean_im.save(subject_path, "JPEG", quality=95)
 
         with open(subject_path, "rb") as sf:
             data_uri = "data:image/jpeg;base64," + base64.b64encode(sf.read()).decode("ascii")
@@ -851,7 +885,9 @@ def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
         if browser:
             html_path = os.path.join(work_dir, "thumb.html")
             png_path = os.path.join(work_dir, "thumb.png")
-            html_content = build_youtube_16x9_html(data_uri, hook_data, use_split_hero, theme)
+            html_content = build_viral_thumbnail_html(
+                data_uri, hook_data, target_w, target_h, extracted_card_window, theme
+            )
             with open(html_path, "w", encoding="utf-8") as hf:
                 hf.write(html_content)
 
@@ -875,7 +911,7 @@ def generate_viral_thumbnail(video_path, dest_thumb_path, hook_data):
                     cropped = rendered.convert("RGB").crop((0, 0, target_w, target_h))
                     save_optimized_jpeg(cropped, dest_thumb_path)
                 print(
-                    f"Viral 16:9 YouTube thumbnail generated ({target_w}x{target_h}, "
+                    f"Viral YouTube thumbnail generated ({target_w}x{target_h}, "
                     f"theme={theme['name']}, size={os.path.getsize(dest_thumb_path) // 1024}KB)."
                 )
                 return True
@@ -941,16 +977,16 @@ def upload_to_youtube(youtube, video_path, title, description, tags):
     return video_id
 
 
-def set_youtube_thumbnail(youtube, video_id, thumb_path):
+def set_youtube_thumbnail(youtube, video_id, thumb_path, wait_sec=45):
     if not video_id or not os.path.exists(thumb_path):
         return
-    # youtube.upload টোকেনেই কাজ করার জন্য videos.list এর বদলে সরাসরি ৪৫ সেকেন্ড প্রসেসিং ওয়েট
-    print("Waiting 45 seconds for YouTube video processing before applying custom thumbnail...")
-    time.sleep(45)
+    if wait_sec > 0:
+        print(f"Waiting {wait_sec} seconds for YouTube video processing before applying custom thumbnail...")
+        time.sleep(wait_sec)
     try:
         media = MediaFileUpload(thumb_path, mimetype="image/jpeg", resumable=False)
         youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
-        print(f"Custom 16:9 viral thumbnail applied to YouTube video {video_id}!")
+        print(f"Custom viral thumbnail applied to YouTube video {video_id}!")
     except Exception as e:
         print(f"[Warning] Could not apply custom YouTube thumbnail (check if channel is phone-verified): {e}")
 
@@ -1025,6 +1061,36 @@ def append_attribution(description, attribution):
     return f"{trimmed_base}\n\n{attr_text}" if trimmed_base else attr_text[:5000]
 
 
+def repair_existing_thumbnails(drive, youtube, uploaded_ids, target_yt_ids):
+    """Regenerates and applies crisp 9:16/16:9 thumbnails for already-published YouTube videos without re-uploading."""
+    configured_folders = get_configured_folders()
+    all_drive_files = {}
+    for folder in configured_folders:
+        try:
+            for f in list_drive_videos(drive, folder["folder_id"]):
+                all_drive_files[f["id"]] = f["name"]
+        except Exception:
+            continue
+
+    # Match the last N uploaded Drive IDs to the provided YouTube video IDs in order
+    pairs = list(zip(uploaded_ids[-len(target_yt_ids):], target_yt_ids))
+    for drive_id, yt_vid_id in pairs:
+        fname = all_drive_files.get(drive_id, "English Speaking Tips.mp4")
+        print(f"\n[Repair] Regenerating thumbnail for YouTube {yt_vid_id} (Drive file: {fname})...")
+        meta = generate_seo_metadata(fname)
+        hook_data = meta[3] if meta else {"badge": "🔥 গোপন কৌশল!", "line1": "ইংরেজিতে ভয়?", "line2": "আজই জয় করুন!"}
+        t_vid = os.path.join(tempfile.gettempdir(), f"rep_{yt_vid_id}.mp4")
+        t_jpg = os.path.join(tempfile.gettempdir(), f"rep_{yt_vid_id}.jpg")
+        try:
+            download_video(drive, drive_id, t_vid)
+            if generate_viral_thumbnail(t_vid, t_jpg, hook_data):
+                set_youtube_thumbnail(youtube, yt_vid_id, t_jpg, wait_sec=0)
+        finally:
+            for p in (t_vid, t_jpg):
+                if os.path.exists(p):
+                    os.remove(p)
+
+
 def main():
     configured_folders = get_configured_folders()
     if not configured_folders:
@@ -1033,8 +1099,14 @@ def main():
 
     drive, youtube = get_google_services()
     uploaded_ids = load_uploaded_ids()
-    uploaded_set = set(uploaded_ids)
 
+    if REPAIR_VIDEO_IDS:
+        yt_ids = [v.strip() for v in REPAIR_VIDEO_IDS.split(",") if v.strip()]
+        if yt_ids:
+            repair_existing_thumbnails(drive, youtube, uploaded_ids, yt_ids)
+            return
+
+    uploaded_set = set(uploaded_ids)
     shuffled_folders = list(configured_folders)
     random.shuffle(shuffled_folders)
 
@@ -1085,7 +1157,7 @@ def main():
         thumb_ok = generate_viral_thumbnail(temp_path, thumb_path, hook_data)
         video_id = upload_to_youtube(youtube, temp_path, title, description, tags)
         if thumb_ok and video_id:
-            set_youtube_thumbnail(youtube, video_id, thumb_path)
+            set_youtube_thumbnail(youtube, video_id, thumb_path, wait_sec=45)
     finally:
         for p in (temp_path, thumb_path):
             if os.path.exists(p):
