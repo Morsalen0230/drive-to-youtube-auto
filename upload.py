@@ -565,13 +565,15 @@ def inspect_video_specs(video_path):
 
 def estimate_skin_presence(rgb_crop):
     """Estimates proportion of warm human skin-tone pixels so speaker faces beat B-roll objects."""
-    tiny = rgb_crop.resize((64, 64))
-    pixels = list(tiny.getdata())
+    tiny = rgb_crop.convert("RGB").resize((64, 64))
+    raw = tiny.tobytes()
+    total = len(raw) // 3
     skin_count = 0
-    for r, g, b in pixels:
+    for i in range(0, len(raw), 3):
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
         if r > 90 and g > 40 and b > 20 and r > g and (r - g) >= 12 and (r - b) >= 20 and r < 248:
             skin_count += 1
-    return skin_count / max(len(pixels), 1)
+    return skin_count / max(total, 1)
 
 
 def score_candidate_frame(img):
@@ -607,7 +609,7 @@ def score_candidate_frame(img):
 
 
 def extract_best_video_frame(video_path, duration, work_dir):
-    ratios = [0.08, 0.16, 0.24, 0.33, 0.42, 0.52, 0.62, 0.72, 0.82, 0.90]
+    ratios = [0.15, 0.23, 0.31, 0.40, 0.50, 0.60, 0.69, 0.77]
     best_path = None
     best_score = -1.0
 
